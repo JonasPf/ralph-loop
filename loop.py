@@ -34,15 +34,35 @@ BUILD_DEFAULT_ITERATIONS = 20
 BUILD_PROMPT_TEMPLATE = """\
 Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item.
 
+You are the **build agent**. You coordinate implementation and delegate verification to a dedicated QA agent. Never mark an item `- [x]` yourself — only the QA agent may do that.
+
+## Phase 1 — Implement
+
 Search the codebase before assuming anything is missing — use up to 500 parallel Sonnet subagents for search/read, 1 Sonnet subagent for build/test, Opus subagents for complex reasoning (debugging, architecture).
 
 Implement the item fully — no placeholders or stubs. Build, test, and lint. Fix any failures including pre-existing ones.
 
-Update @IMPLEMENTATION_PLAN.md throughout: `- [x]` when done, add new findings, document bugs. Periodically prune completed items. Use a subagent for plan updates.
-
 Update @CLAUDE.md (via subagent) only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
 
 Fix spec inconsistencies in `specs/*` using an Opus subagent. Documentation should capture *why*, not just *what*.
+
+## Phase 2 — QA verification
+
+Once you believe the item is complete, launch an **Opus QA subagent** with the following instructions. Pass it the exact item text from the plan and the relevant spec filenames.
+
+The QA agent must:
+1. Read the relevant specs in `specs/*` to understand the expected behavior.
+2. Read the implementation (search the codebase — do NOT trust the build agent's description of what was done).
+3. Run the build, tests, and linter independently to confirm they pass.
+4. Verify every acceptance criterion from the spec is satisfied — not just that tests pass, but that the feature actually works as specified.
+5. Return a verdict: **PASS** or **FAIL** with a detailed explanation.
+
+If the QA agent returns **FAIL**:
+- Read its feedback, fix the issues, and resubmit to a new QA subagent. Repeat until it passes.
+- Do NOT mark the item as done.
+
+If the QA agent returns **PASS**:
+- Update @IMPLEMENTATION_PLAN.md: mark the item `- [x]`, add new findings, document bugs. Periodically prune completed items. Use a subagent for plan updates.
 """
 
 PLAN_PROMPT_TEMPLATE = """\
@@ -260,31 +280,6 @@ def get_git_branch() -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
-def get_commits_since(ref: str) -> list[dict]:
-    """Return commits made since the given ref."""
-    result = subprocess.run(
-        ["git", "log", f"{ref}..HEAD", "--oneline", "--no-decorate"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
-
-    commits = []
-    for line in result.stdout.strip().splitlines():
-        parts = line.split(" ", 1)
-        if len(parts) == 2:
-            commits.append({"hash": parts[0], "message": parts[1]})
-    return commits
-
-
-def get_diff_stat_since(ref: str) -> str:
-    """Return a short diffstat since the given ref."""
-    result = subprocess.run(
-        ["git", "diff", "--stat", f"{ref}..HEAD"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else ""
-
 
 def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
     """Run a single Claude CLI iteration and parse the streaming JSON output.
@@ -405,7 +400,6 @@ def print_iteration_report(
     iteration: int,
     iter_result: dict,
     totals: dict,
-    head_before: str,
 ) -> None:
     """Print a human-readable report after a loop iteration."""
 
@@ -431,23 +425,6 @@ def print_iteration_report(
     print(f"      Output: {c(CYAN, fmt_tokens(totals['tokens_out']))} tokens")
     print(f"      Cost:   {c(DIM, fmt_cost(totals['cost_usd']))}")
     print(f"      Time:   {fmt_duration(totals['duration_s'])}")
-
-    # Changes summary
-    commits = get_commits_since(head_before)
-    if commits:
-        print()
-        info(f"Commits this iteration:")
-        for cm in commits:
-            print(f"      {c(YELLOW, cm['hash'])} {cm['message']}")
-
-        diffstat = get_diff_stat_since(head_before)
-        if diffstat:
-            last_line = diffstat.splitlines()[-1] if diffstat else ""
-            if last_line:
-                print(f"      {c(DIM, last_line.strip())}")
-    else:
-        print()
-        info(f"No new commits this iteration")
 
     print()
 
@@ -707,8 +684,6 @@ def main() -> int:
                 if plan_tasks["total"] > 0:
                     print_plan_summary(plan_tasks)
 
-            head_before = get_git_head()
-
             # ── Run Claude ───────────────────────────────────────────────
 
             info("Running Claude...")
@@ -731,7 +706,7 @@ def main() -> int:
 
             # ── Post-iteration report ────────────────────────────────────
 
-            print_iteration_report(iteration, iter_result, totals, head_before)
+            print_iteration_report(iteration, iter_result, totals)
 
             # ── Checkpoint commit ────────────────────────────────────────
 
