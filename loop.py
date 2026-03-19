@@ -456,8 +456,7 @@ def print_iteration_report(
 
 
 def init_project() -> int:
-    """Generate prompt files and update .gitignore for loop usage."""
-    # Generate prompt files
+    """Generate prompt files for loop usage."""
     files = {
         BUILD_PROMPT: BUILD_PROMPT_TEMPLATE,
         PLAN_PROMPT: PLAN_PROMPT_TEMPLATE,
@@ -469,29 +468,6 @@ def init_project() -> int:
             warn(f"{filename} already exists, overwriting")
         path.write_text(content)
         success(f"Generated {filename}")
-
-    # Update .gitignore
-    gitignore_entries = [PLAN_PROMPT, BUILD_PROMPT, IMPLEMENTATION_PLAN]
-    gitignore_path = Path(".gitignore")
-
-    existing_lines = set()
-    if gitignore_path.exists():
-        existing_lines = set(gitignore_path.read_text().splitlines())
-
-    to_add = [entry for entry in gitignore_entries if entry not in existing_lines]
-
-    if to_add:
-        with open(gitignore_path, "a") as f:
-            # Add a newline before our entries if file exists and doesn't end with one
-            if gitignore_path.stat().st_size > 0:
-                existing = gitignore_path.read_text()
-                if not existing.endswith("\n"):
-                    f.write("\n")
-            for entry in to_add:
-                f.write(f"{entry}\n")
-        success(f"Added {', '.join(to_add)} to .gitignore")
-    else:
-        info("All entries already in .gitignore")
 
     print()
     info("Next steps:")
