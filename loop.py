@@ -621,7 +621,14 @@ def main() -> int:
         return 1
     success("Auto-compact is not enabled")
 
-    # 4. Prompt file
+    # 4. CLAUDE.md
+    if not Path("CLAUDE.md").exists():
+        error("CLAUDE.md not found.")
+        info("Create a CLAUDE.md file before starting the loop.")
+        return 1
+    success("CLAUDE.md found")
+
+    # 5. Prompt file
     if not check_prompt_file(prompt_file):
         return 1
     success(f"Prompt file found: {prompt_file}")
