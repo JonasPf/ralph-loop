@@ -32,37 +32,49 @@ BUILD_DEFAULT_ITERATIONS = 20
 # ─── Prompt templates ────────────────────────────────────────────────────────
 
 BUILD_PROMPT_TEMPLATE = """\
+You are the **team lead**. You coordinate a builder and a QA teammate to implement items from the plan.
+
 Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item.
 
-You are the **build agent**. You coordinate implementation and delegate verification to a dedicated QA agent. Never mark an item `- [x]` yourself — only the QA agent may do that.
+## Team setup
 
-## Phase 1 — Implement
+Spawn two teammates:
 
-Search the codebase before assuming anything is missing — use up to 500 parallel Sonnet subagents for search/read, 1 Sonnet subagent for build/test, Opus subagents for complex reasoning (debugging, architecture).
+1. **builder** — implements the chosen item. Spawn with this prompt:
 
-Implement the item fully — no placeholders or stubs. Build, test, and lint. Fix any failures including pre-existing ones.
+   > You are the builder. Your task: implement the following item from IMPLEMENTATION_PLAN.md:
+   >
+   > `{ITEM_TEXT}`
+   >
+   > Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing — use up to 500 parallel Sonnet subagents for search/read, Opus subagents for complex reasoning (debugging, architecture).
+   >
+   > Implement the item fully — no placeholders or stubs. Build, test, and lint. Fix any failures including pre-existing ones.
+   >
+   > Fix spec inconsistencies in `specs/*` using an Opus subagent. Documentation should capture *why*, not just *what*.
+   >
+   > When done, message the **qa** teammate with a summary of what you implemented and which spec files are relevant. Do NOT mark the item as done in IMPLEMENTATION_PLAN.md.
 
-Update @CLAUDE.md (via subagent) only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
+2. **qa** — independently verifies the work. Spawn with this prompt:
 
-Fix spec inconsistencies in `specs/*` using an Opus subagent. Documentation should capture *why*, not just *what*.
+   > You are the QA reviewer. Wait for a message from the **builder** teammate telling you what was implemented and which spec files are relevant.
+   >
+   > Do NOT read the implementation code. You are a black-box tester — verify behavior, not source.
+   >
+   > Then independently verify the work:
+   > 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
+   > 2. Run the build, tests, and linter to confirm they pass.
+   > 3. Write and run your own verification checks to exercise the feature against every acceptance criterion in the spec. Do not rely solely on the existing test suite — it was written by the builder.
+   > 4. If anything fails or does not match the spec, message the **builder** with specific feedback on what is wrong. Do not say how to fix it — just describe the expected vs actual behavior. Repeat until satisfied.
+   > 5. When everything passes, message the **lead** with: `PASS: {ITEM_TEXT}` and a brief explanation.
 
-## Phase 2 — QA verification
+## Your role as lead
 
-Once you believe the item is complete, launch an **Opus QA subagent** with the following instructions. Pass it the exact item text from the plan and the relevant spec filenames.
-
-The QA agent must:
-1. Read the relevant specs in `specs/*` to understand the expected behavior.
-2. Read the implementation (search the codebase — do NOT trust the build agent's description of what was done).
-3. Run the build, tests, and linter independently to confirm they pass.
-4. Verify every acceptance criterion from the spec is satisfied — not just that tests pass, but that the feature actually works as specified.
-5. Return a verdict: **PASS** or **FAIL** with a detailed explanation.
-
-If the QA agent returns **FAIL**:
-- Read its feedback, fix the issues, and resubmit to a new QA subagent. Repeat until it passes.
-- Do NOT mark the item as done.
-
-If the QA agent returns **PASS**:
-- Update @IMPLEMENTATION_PLAN.md: mark the item `- [x]`, add new findings, document bugs. Periodically prune completed items. Use a subagent for plan updates.
+- Create tasks for each teammate and monitor progress.
+- Do NOT implement or verify anything yourself.
+- When the **qa** teammate messages you with a PASS verdict, update @IMPLEMENTATION_PLAN.md: mark the item `- [x]`, add new findings, document bugs. Periodically prune completed items.
+- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec that can't be resolved, external dependency), mark it `- [B]` in IMPLEMENTATION_PLAN.md with a brief reason, then move on to the next unchecked item.
+- If the teammates get stuck in a fix/verify loop for more than 3 rounds, step in to analyze the issue. If you can provide direction that unblocks them, do so. If the issue genuinely requires human input, mark it `- [B]` and move on.
+- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
 """
 
 PLAN_PROMPT_TEMPLATE = """\
@@ -217,10 +229,10 @@ def check_prompt_file(prompt_file: str) -> bool:
 def parse_plan_tasks(path: str = IMPLEMENTATION_PLAN) -> dict:
     """Parse IMPLEMENTATION_PLAN.md and return task statistics.
 
-    Returns dict with keys: total, done, pending, tasks (list of dicts).
-    Tasks are identified by markdown checkbox syntax: - [ ] or - [x].
+    Returns dict with keys: total, done, pending, blocked, tasks (list of dicts).
+    Tasks are identified by markdown checkbox syntax: - [ ], - [x], or - [B].
     """
-    result = {"total": 0, "done": 0, "pending": 0, "tasks": []}
+    result = {"total": 0, "done": 0, "pending": 0, "blocked": 0, "tasks": []}
 
     plan_path = Path(path)
     if not plan_path.exists():
@@ -229,17 +241,21 @@ def parse_plan_tasks(path: str = IMPLEMENTATION_PLAN) -> dict:
     text = plan_path.read_text()
     for line in text.splitlines():
         stripped = line.strip()
-        # Match markdown checkboxes:  - [ ] task  or  - [x] task  or  * [x] task
-        m = re.match(r'^[-*]\s+\[([ xX])\]\s+(.*)', stripped)
+        # Match markdown checkboxes:  - [ ] / - [x] / - [B]  or  * [x] etc.
+        m = re.match(r'^[-*]\s+\[([ xXbB])\]\s+(.*)', stripped)
         if m:
-            checked = m.group(1).lower() == 'x'
+            marker = m.group(1)
             task_text = m.group(2).strip()
             result["total"] += 1
-            if checked:
+            if marker.lower() == 'x':
                 result["done"] += 1
+                result["tasks"].append({"text": task_text, "status": "done"})
+            elif marker.lower() == 'b':
+                result["blocked"] += 1
+                result["tasks"].append({"text": task_text, "status": "blocked"})
             else:
                 result["pending"] += 1
-            result["tasks"].append({"text": task_text, "done": checked})
+                result["tasks"].append({"text": task_text, "status": "pending"})
 
     return result
 
@@ -256,7 +272,8 @@ def print_plan_summary(tasks: dict) -> None:
     bar = c(GREEN, "#" * filled) + c(DIM, "-" * (bar_width - filled))
 
     info(f"Progress: [{bar}] {pct:.0f}%")
-    info(f"Tasks: {c(GREEN, str(tasks['done']))} done / {c(YELLOW, str(tasks['pending']))} pending / {tasks['total']} total")
+    blocked_str = f" / {c(RED, str(tasks['blocked']))} blocked" if tasks["blocked"] else ""
+    info(f"Tasks: {c(GREEN, str(tasks['done']))} done / {c(YELLOW, str(tasks['pending']))} pending{blocked_str} / {tasks['total']} total")
 
 
 # ─── Claude interaction ───────────────────────────────────────────────────────
@@ -301,7 +318,11 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
     }
 
     try:
-        env = {**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+        env = {
+            **os.environ,
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+        }
         proc = subprocess.Popen(
             [
                 "claude", "-p",
@@ -618,6 +639,7 @@ def main() -> int:
     info(f"Prompt:     {prompt_file}")
     info(f"Max iters:  {max_iterations}")
     if mode == "build":
+        info(f"Agent team: {c(GREEN, 'lead + builder + qa')}")
         info(f"Stop on completion: {c(GREEN, 'yes') if stop_on_complete else c(DIM, 'no')}")
 
     # Show plan status if in build mode
@@ -660,14 +682,20 @@ def main() -> int:
                 warn("No changes detected in the last 2 iterations. Stopping.")
                 break
 
-            # In build mode, check if plan is complete
+            # In build mode, check if plan is complete or only blocked items remain
             if stop_on_complete and iteration > 1:
                 plan_tasks = parse_plan_tasks()
                 if plan_tasks["total"] > 0 and plan_tasks["pending"] == 0:
                     print()
-                    banner("All tasks complete!")
-                    print_plan_summary(plan_tasks)
-                    success("Implementation plan is fully checked off. Stopping.")
+                    if plan_tasks["blocked"] > 0:
+                        banner("No actionable tasks remain")
+                        print_plan_summary(plan_tasks)
+                        warn(f"{plan_tasks['blocked']} task(s) blocked — needs human intervention.")
+                    else:
+                        banner("All tasks complete!")
+                        print_plan_summary(plan_tasks)
+                        success("Implementation plan is fully checked off.")
+                    info("Stopping.")
                     break
 
             # ── Iteration header ─────────────────────────────────────────
