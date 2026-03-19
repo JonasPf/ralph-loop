@@ -48,11 +48,13 @@ Spawn two teammates:
    >
    > Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing — use up to 500 parallel Sonnet subagents for search/read, Opus subagents for complex reasoning (debugging, architecture).
    >
-   > Implement the item fully — no placeholders or stubs. Build, test, and lint. Fix any failures including pre-existing ones.
+   > Implement the item fully — no placeholders or stubs. Fix any failures including pre-existing ones.
    >
    > Fix spec inconsistencies in `specs/*` using an Opus subagent. Documentation should capture *why*, not just *what*.
    >
-   > When done, message the **qa** teammate with a summary of what you implemented and which spec files are relevant. Do NOT mark the item as done in IMPLEMENTATION_PLAN.md.
+   > Before testing, run `/simplify` to review your changes for reuse, quality, and efficiency, and fix any issues found.
+   >
+   > Then build, test, and lint. When done, message the **qa** teammate with a summary of what you implemented and which spec files are relevant. Do NOT mark the item as done in IMPLEMENTATION_PLAN.md.
 
 2. **qa** — independently verifies the work. Spawn with this prompt:
 
