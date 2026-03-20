@@ -316,6 +316,7 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         "cache_creation": 0,
         "duration_s": 0,
         "cost_usd": 0,
+        "result_text": "",
         "error": None,
     }
 
@@ -355,9 +356,16 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
 
             etype = event.get("type", "")
 
+            # Collect assistant text output
+            if etype == "assistant" and "message" in event:
+                for block in event["message"].get("content", []):
+                    if block.get("type") == "text":
+                        result_data["result_text"] += block["text"]
+
             # Collect usage from the result event
             if etype == "result":
                 result_data["cost_usd"] = event.get("total_cost_usd", 0)
+                result_data["result_text"] = event.get("result", result_data["result_text"])
                 result_data["success"] = True
 
                 # modelUsage has cumulative per-model totals
@@ -490,13 +498,17 @@ def has_uncommitted_changes() -> bool:
     return staged.returncode != 0 or unstaged.returncode != 0 or bool(untracked.stdout.strip())
 
 
-def commit_checkpoint(mode: str, iteration: int, max_iterations: int) -> bool:
+def commit_checkpoint(mode: str, iteration: int, max_iterations: int, summary: str = "") -> bool:
     """Stage all changes and create a checkpoint commit. Returns True if a commit was made."""
     if not has_uncommitted_changes():
         return False
 
     label = mode.capitalize()
-    msg = f"{label} Checkpoint - Iteration {iteration}/{max_iterations}"
+    title = f"{label} Checkpoint - Iteration {iteration}/{max_iterations}"
+    if summary:
+        msg = f"{title}\n\n{summary}"
+    else:
+        msg = title
     subprocess.run(["git", "add", "-A"], capture_output=True)
     subprocess.run(["git", "commit", "-m", msg], capture_output=True)
     return True
@@ -723,7 +735,7 @@ def main() -> int:
 
             # ── Checkpoint commit ────────────────────────────────────────
 
-            committed = commit_checkpoint(mode, iteration, max_iterations)
+            committed = commit_checkpoint(mode, iteration, max_iterations, iter_result.get("result_text", ""))
             if committed:
                 consecutive_no_changes = 0
                 success(f"Checkpoint commit: {mode.capitalize()} Checkpoint - Iteration {iteration}/{max_iterations}")
