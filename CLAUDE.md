@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is the **Ralph Wiggum Loop** — a Python script (`loop.py`) that drives Claude Code iteratively in two modes:
 
 - **Plan mode**: Reads specs and codebase, generates/updates `IMPLEMENTATION_PLAN.md` as a prioritized checkbox list
-- **Build mode**: Spawns an agent team (lead + builder + qa) to implement and verify items from the plan, then commits and repeats
+- **Build mode**: Implements items from the plan, then spawns reviewer and QA subagents to verify, commits and repeats
 
 ## Commands
 
@@ -41,4 +41,4 @@ python loop.py build --model sonnet   # use a different model (default: opus)
 - Stops after 2 consecutive iterations with no changes
 - In build mode, stops when all plan tasks are checked off (unless `--no-stop`)
 - Disables Claude's auto-memory via `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
-- Enables agent teams via `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` for build mode's lead/builder/qa workflow
+- Spawns reviewer and QA subagents (fresh context each) to verify work before marking tasks complete

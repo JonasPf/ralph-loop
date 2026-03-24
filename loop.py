@@ -32,61 +32,78 @@ BUILD_DEFAULT_ITERATIONS = 20
 # ─── Prompt templates ────────────────────────────────────────────────────────
 
 BUILD_PROMPT_TEMPLATE = """\
-You are the **team lead**. You coordinate a builder and a QA teammate to implement items from the plan.
+Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item and implement it.
 
-Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item.
+## Implementation
 
-## Team setup
+Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing. Use as many subagents as needed to parallelize work.
 
-Spawn two teammates:
+Implement the item fully — no placeholders or stubs. Fix any failures including pre-existing ones.
 
-1. **builder** — implements the chosen item. Spawn with this prompt:
+Use TDD — write tests first, then implement to make them pass. Keep code DRY and lean.
 
-   > You are the builder. Your task: implement the following item from IMPLEMENTATION_PLAN.md:
-   >
-   > `{ITEM_TEXT}`
-   >
-   > Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing — use up to 500 parallel Sonnet subagents for search/read, Opus subagents for complex reasoning (debugging, architecture).
-   >
-   > Implement the item fully — no placeholders or stubs. Fix any failures including pre-existing ones.
-   >
-   > Fix spec inconsistencies in `specs/*` using an Opus subagent. Documentation should capture *why*, not just *what*.
-   >
-   > Before testing, run `/simplify` to review your changes for reuse, quality, and efficiency, and fix any issues found.
-   >
-   > Then build, test, and lint. When done, message the **qa** teammate with a summary of what you implemented and which spec files are relevant. Do NOT mark the item as done in IMPLEMENTATION_PLAN.md.
+Build, test, and lint. All must pass before proceeding.
 
-2. **qa** — independently verifies the work. Spawn with this prompt:
+## Review
 
-   > You are the QA reviewer. Wait for a message from the **builder** teammate telling you what was implemented and which spec files are relevant.
-   >
-   > Do NOT read the implementation code. You are a black-box tester — verify behavior, not source.
-   >
-   > Then independently verify the work:
-   > 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
-   > 2. Run the build, tests, and linter to confirm they pass.
-   > 3. Write and run your own verification checks to exercise the feature against every acceptance criterion in the spec. Do not rely solely on the existing test suite — it was written by the builder.
-   > 4. If anything fails or does not match the spec, message the **builder** with specific feedback on what is wrong. Do not say how to fix it — just describe the expected vs actual behavior. Repeat until satisfied.
-   > 5. When everything passes, message the **lead** with: `PASS: {ITEM_TEXT}` and a brief explanation.
+When implementation is complete, spawn a **reviewer** subagent with a fresh context. Include the task text from the plan in the subagent prompt so it knows what was implemented.
 
-## Your role as lead
+> You are a code reviewer. The task being implemented is: `{TASK}`. Review the recent changes (use `git diff HEAD~1` or similar) against the specs in `specs/*`.
+>
+> Check for:
+> 1. Correctness — does the code implement what the spec requires?
+> 2. Test quality — are the tests thorough? Do they cover the acceptance criteria from the spec? Are there missing edge cases?
+> 3. Code quality — readability, naming, structure, no dead code or stubs
+> 4. Bugs — off-by-one errors, unhandled errors, race conditions, security issues
+>
+> If you find issues, report them as a list with file paths and line numbers. Be specific.
+> If everything looks good, respond with: `REVIEW PASS`
+>
+> You may add new items to @IMPLEMENTATION_PLAN.md if you discover things that need to be done. You may mark items as `- [B]` (blocked) if they need human intervention. Do NOT mark items as `- [x]` (done).
 
-- Create tasks for each teammate and monitor progress.
-- Do NOT implement or verify anything yourself.
-- When the **qa** teammate messages you with a PASS verdict, update @IMPLEMENTATION_PLAN.md: mark the item `- [x]`, add new findings, document bugs. Periodically prune completed items.
-- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec that can't be resolved, external dependency), mark it `- [B]` in IMPLEMENTATION_PLAN.md with a brief reason, then move on to the next unchecked item.
-- If the teammates get stuck in a fix/verify loop for more than 3 rounds, step in to analyze the issue. If you can provide direction that unblocks them, do so. If the issue genuinely requires human input, mark it `- [B]` and move on.
+If the reviewer reports issues, fix them and restart from the review step.
+
+## QA
+
+After the reviewer passes, spawn a **QA** subagent with a fresh context. Include the task text from the plan in the subagent prompt.
+
+> You are the QA verifier. The task being verified is: `{TASK}`. Your job is to independently verify that the implementation matches the spec.
+>
+> Do NOT read the implementation code. You are a black-box tester — verify behavior, not source.
+>
+> 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
+> 2. Run the build, tests, and linter to confirm they pass.
+> 3. Write and run your own verification checks to exercise the feature against every acceptance criterion in the spec. Do not rely solely on the existing test suite — it was written by the implementer.
+> 4. If anything fails or does not match the spec, report exactly what is wrong: expected vs actual behavior.
+> 5. If everything passes, respond with: `QA PASS`
+>
+> You may add new items to @IMPLEMENTATION_PLAN.md if you discover things that need to be done. You may mark items as `- [B]` (blocked) if they need human intervention. You MUST mark the current item as `- [x]` (done) when all checks pass.
+
+If QA reports failures, fix the issues and restart from the review step (new reviewer, then new QA — both with fresh contexts). Repeat until both pass.
+
+## Completion rules
+
+- A task is only done when BOTH the reviewer and QA subagent pass.
+- Only the QA subagent may mark a task as `- [x]` in IMPLEMENTATION_PLAN.md.
+- Any agent (you, reviewer, QA) may mark a task as `- [B]` (blocked) with a reason.
+- Any agent may add new items to IMPLEMENTATION_PLAN.md.
+- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
+- If stuck in a fix/verify loop for more than 3 rounds, mark the task `- [B]` and move on.
 - Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
+
+When done, output a brief summary (1-3 sentences) of what changed in this iteration. This will be used as the commit message.
 """
 
 PLAN_PROMPT_TEMPLATE = """\
 Plan only — do NOT implement anything.
 
-Read `specs/*` (up to 250 parallel Sonnet subagents) and @IMPLEMENTATION_PLAN.md (if present; it may be stale or wrong).
+Read `specs/*` and @IMPLEMENTATION_PLAN.md (if present; it may be stale or wrong).
 
-Search the codebase with up to 500 Sonnet subagents to verify what is and isn't implemented. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
+Search the codebase to verify what is and isn't implemented. Use as many subagents as needed to parallelize work. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
 
-Use an Opus subagent to analyze findings and produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
+Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
+
+When done, output a brief summary (1-3 sentences) of what changed in this iteration. This will be used as the commit message.
 """
 
 # ─── Terminal helpers ─────────────────────────────────────────────────────────
@@ -324,7 +341,6 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         env = {
             **os.environ,
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
         }
         proc = subprocess.Popen(
             [
@@ -636,7 +652,6 @@ def main() -> int:
     info(f"Prompt:     {prompt_file}")
     info(f"Max iters:  {max_iterations}")
     if mode == "build":
-        info(f"Agent team: {c(GREEN, 'lead + builder + qa')}")
         info(f"Stop on completion: {c(GREEN, 'yes') if stop_on_complete else c(DIM, 'no')}")
 
     # Show plan status if in build mode
