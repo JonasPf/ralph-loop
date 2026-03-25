@@ -517,17 +517,77 @@ def has_uncommitted_changes() -> bool:
     return staged.returncode != 0 or unstaged.returncode != 0 or bool(untracked.stdout.strip())
 
 
-def commit_checkpoint(mode: str, iteration: int, max_iterations: int, summary: str = "") -> bool:
+def build_commit_message(
+    mode: str,
+    iteration: int,
+    max_iterations: int,
+    summary: str,
+    iter_result: dict,
+    model: str,
+    stop_reason: str = "",
+) -> str:
+    """Build a structured commit message with metrics."""
+    label = mode.capitalize()
+
+    # Extract first line of summary as headline
+    lines = summary.strip().splitlines() if summary.strip() else []
+    headline = lines[0].strip().rstrip(".") if lines else "No summary"
+    # Truncate headline to keep commit title readable
+    if len(headline) > 72:
+        headline = headline[:69] + "..."
+
+    title = f"{label} ({iteration}/{max_iterations}) - {headline}"
+
+    parts = [title, ""]
+
+    if stop_reason:
+        parts.append(stop_reason)
+        parts.append("")
+
+    # Summary
+    if summary.strip():
+        parts.append("## Summary")
+        parts.append("")
+        parts.append(summary.strip())
+        parts.append("")
+
+    # Metrics
+    plan_tasks = parse_plan_tasks()
+    parts.append("## Iteration Metrics")
+    parts.append("")
+
+    if plan_tasks["total"] > 0:
+        pct = (plan_tasks["done"] / plan_tasks["total"]) * 100
+        bar_width = 20
+        filled = int(bar_width * plan_tasks["done"] / plan_tasks["total"])
+        bar = "#" * filled + "-" * (bar_width - filled)
+        blocked_str = f" / {plan_tasks['blocked']} blocked" if plan_tasks["blocked"] else ""
+        parts.append(f"Progress: [{bar}] {pct:.0f}%")
+        parts.append(f"Tasks: {plan_tasks['done']} done / {plan_tasks['pending']} pending{blocked_str} / {plan_tasks['total']} total")
+
+    parts.append(f"Duration: {fmt_duration(iter_result['duration_s'])}")
+    parts.append(f"Model: {model}")
+    if iter_result.get("cost_usd"):
+        parts.append(f"Cost: {fmt_cost(iter_result['cost_usd'])}")
+    parts.append(f"Tokens: {fmt_tokens(iter_result['tokens_in'])} in / {fmt_tokens(iter_result['tokens_out'])} out / {fmt_tokens(iter_result.get('cache_read', 0))} cache")
+
+    return "\n".join(parts)
+
+
+def commit_checkpoint(
+    mode: str,
+    iteration: int,
+    max_iterations: int,
+    summary: str,
+    iter_result: dict,
+    model: str,
+    stop_reason: str = "",
+) -> bool:
     """Stage all changes and create a checkpoint commit. Returns True if a commit was made."""
     if not has_uncommitted_changes():
         return False
 
-    label = mode.capitalize()
-    title = f"{label} Checkpoint - Iteration {iteration}/{max_iterations}"
-    if summary:
-        msg = f"{title}\n\n{summary}"
-    else:
-        msg = title
+    msg = build_commit_message(mode, iteration, max_iterations, summary, iter_result, model, stop_reason)
     subprocess.run(["git", "add", "-A"], capture_output=True)
     subprocess.run(["git", "commit", "-m", msg], capture_output=True)
     return True
@@ -753,7 +813,7 @@ def main() -> int:
 
             # ── Checkpoint commit ────────────────────────────────────────
 
-            committed = commit_checkpoint(mode, iteration, max_iterations, iter_result.get("result_text", ""))
+            committed = commit_checkpoint(mode, iteration, max_iterations, iter_result.get("result_text", ""), iter_result, model)
             if committed:
                 consecutive_no_changes = 0
                 success(f"Checkpoint commit: {mode.capitalize()} Checkpoint - Iteration {iteration}/{max_iterations}")
