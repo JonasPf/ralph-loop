@@ -445,36 +445,14 @@ def fmt_cost(usd: float) -> str:
     return f"${usd:.2f}"
 
 
-def print_iteration_report(
-    iteration: int,
-    iter_result: dict,
-    totals: dict,
-) -> None:
-    """Print a human-readable report after a loop iteration."""
-
-    section(f"Iteration {iteration} Complete")
-
-    # Duration
-    info(f"Duration: {fmt_duration(iter_result['duration_s'])}")
-
-    # Token usage for this iteration
-    print()
-    info(f"This iteration:")
-    print(f"      Input:  {c(CYAN, fmt_tokens(iter_result['tokens_in']))} tokens")
-    print(f"      Output: {c(CYAN, fmt_tokens(iter_result['tokens_out']))} tokens")
-    if iter_result["cache_read"]:
-        print(f"      Cache read: {c(DIM, fmt_tokens(iter_result['cache_read']))} tokens")
-    if iter_result["cost_usd"]:
-        print(f"      Cost: {c(DIM, fmt_cost(iter_result['cost_usd']))}")
-
-    # Running totals
+def print_running_totals(iteration: int, totals: dict) -> None:
+    """Print running totals across all iterations."""
     print()
     info(f"Running totals ({iteration} iteration{'s' if iteration != 1 else ''}):")
     print(f"      Input:  {c(CYAN, fmt_tokens(totals['tokens_in']))} tokens")
     print(f"      Output: {c(CYAN, fmt_tokens(totals['tokens_out']))} tokens")
     print(f"      Cost:   {c(DIM, fmt_cost(totals['cost_usd']))}")
     print(f"      Time:   {fmt_duration(totals['duration_s'])}")
-
     print()
 
 
@@ -573,24 +551,6 @@ def build_commit_message(
 
     return "\n".join(parts)
 
-
-def commit_checkpoint(
-    mode: str,
-    iteration: int,
-    max_iterations: int,
-    summary: str,
-    iter_result: dict,
-    model: str,
-    stop_reason: str = "",
-) -> bool:
-    """Stage all changes and create a checkpoint commit. Returns True if a commit was made."""
-    if not has_uncommitted_changes():
-        return False
-
-    msg = build_commit_message(mode, iteration, max_iterations, summary, iter_result, model, stop_reason)
-    subprocess.run(["git", "add", "-A"], capture_output=True)
-    subprocess.run(["git", "commit", "-m", msg], capture_output=True)
-    return True
 
 
 # ─── Main loop ────────────────────────────────────────────────────────────────
@@ -807,16 +767,25 @@ def main() -> int:
             totals["cost_usd"] += iter_result["cost_usd"]
             totals["duration_s"] += iter_result["duration_s"]
 
-            # ── Post-iteration report ────────────────────────────────────
+            # ── Build report & commit ─────────────────────────────────────
 
-            print_iteration_report(iteration, iter_result, totals)
+            msg = build_commit_message(mode, iteration, max_iterations, iter_result.get("result_text", ""), iter_result, model)
 
-            # ── Checkpoint commit ────────────────────────────────────────
+            # Print the same message that goes into the commit
+            print()
+            print(c(CYAN, f"  {'─' * 50}"))
+            for line in msg.splitlines():
+                print(f"  {line}")
+            print(c(CYAN, f"  {'─' * 50}"))
 
-            committed = commit_checkpoint(mode, iteration, max_iterations, iter_result.get("result_text", ""), iter_result, model)
-            if committed:
+            print_running_totals(iteration, totals)
+
+            # Commit
+            if has_uncommitted_changes():
+                subprocess.run(["git", "add", "-A"], capture_output=True)
+                subprocess.run(["git", "commit", "-m", msg], capture_output=True)
                 consecutive_no_changes = 0
-                success(f"Checkpoint commit: {mode.capitalize()} Checkpoint - Iteration {iteration}/{max_iterations}")
+                success("Committed.")
             else:
                 consecutive_no_changes += 1
                 info(f"No changes to commit ({consecutive_no_changes} consecutive iteration{'s' if consecutive_no_changes != 1 else ''} without changes)")
