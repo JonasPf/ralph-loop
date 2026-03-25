@@ -45,48 +45,30 @@ Use TDD — write tests first, then implement to make them pass. Keep code DRY a
 
 Build, test, and lint. All must pass before proceeding.
 
-## Review
-
-When implementation is complete, spawn a **reviewer** subagent with a fresh context. Include the task text from the plan in the subagent prompt so it knows what was implemented.
-
-> You are a code reviewer. The task being implemented is: `{TASK}`. Review the recent changes (use `git diff HEAD~1` or similar) against the specs in `specs/*`.
->
-> Check for:
-> 1. Correctness — does the code implement what the spec requires?
-> 2. Test quality — are the tests thorough? Do they cover the acceptance criteria from the spec? Are there missing edge cases?
-> 3. Code quality — readability, naming, structure, no dead code or stubs
-> 4. Bugs — off-by-one errors, unhandled errors, race conditions, security issues
->
-> If you find issues, report them as a list with file paths and line numbers. Be specific.
-> If everything looks good, respond with: `REVIEW PASS`
->
-> You may add new items to @IMPLEMENTATION_PLAN.md if you discover things that need to be done. You may mark items as `- [B]` (blocked) if they need human intervention. Do NOT mark items as `- [x]` (done).
-
-If the reviewer reports issues, fix them and restart from the review step.
-
 ## QA
 
-After the reviewer passes, spawn a **QA** subagent with a fresh context. Include the task text from the plan in the subagent prompt.
+When implementation is complete, spawn a **QA** subagent with a fresh context. Include the task text from the plan in the subagent prompt so it knows what was implemented.
 
-> You are the QA verifier. The task being verified is: `{TASK}`. Your job is to independently verify that the implementation matches the spec.
+> You are the QA verifier. The task being verified is: `{TASK}`. Your job is to verify that the tests adequately cover the spec.
 >
-> Do NOT read the implementation code. You are a black-box tester — verify behavior, not source.
+> Do NOT read the implementation code — only read the test files and the specs.
 >
 > 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
-> 2. Run the build, tests, and linter to confirm they pass.
-> 3. Write and run your own verification checks to exercise the feature against every acceptance criterion in the spec. Do not rely solely on the existing test suite — it was written by the implementer.
-> 4. If anything fails or does not match the spec, report exactly what is wrong: expected vs actual behavior.
-> 5. If everything passes, respond with: `QA PASS`
+> 2. Read the test files to check they cover every acceptance criterion from the spec. Look for missing edge cases, untested error paths, and acceptance criteria without corresponding tests.
+> 3. Run the build, tests, and linter to confirm they pass.
+> 4. Start the app and smoke test the new feature(s) end to end — make real requests, verify responses, check that the feature works as a user would experience it. Don't rely solely on automated tests.
+> 5. If there are gaps in test coverage or smoke test failures, report exactly what is missing or broken.
+> 6. If everything is covered, passing, and works end to end, respond with: `QA PASS`
 >
 > You may add new items to @IMPLEMENTATION_PLAN.md if you discover things that need to be done. You may mark items as `- [B]` (blocked) if they need human intervention. You MUST mark the current item as `- [x]` (done) when all checks pass.
 
-If QA reports failures, fix the issues and restart from the review step (new reviewer, then new QA — both with fresh contexts). Repeat until both pass.
+If QA reports failures, fix the issues and re-run the QA subagent (fresh context each time). Repeat until QA passes.
 
 ## Completion rules
 
-- A task is only done when BOTH the reviewer and QA subagent pass.
+- A task is only done when the QA subagent passes.
 - Only the QA subagent may mark a task as `- [x]` in IMPLEMENTATION_PLAN.md.
-- Any agent (you, reviewer, QA) may mark a task as `- [B]` (blocked) with a reason.
+- Any agent (you or QA) may mark a task as `- [B]` (blocked) with a reason.
 - Any agent may add new items to IMPLEMENTATION_PLAN.md.
 - If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
 - If stuck in a fix/verify loop for more than 3 rounds, mark the task `- [B]` and move on.
