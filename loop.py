@@ -74,7 +74,10 @@ If QA reports failures, fix the issues and re-run the QA subagent (fresh context
 - If stuck in a fix/verify loop for more than 3 rounds, mark the task `- [B]` and move on.
 - Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
 
-When done, output a brief summary (1-3 sentences) of what changed in this iteration. This will be used as the commit message.
+When done, output your final message in this exact format:
+
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>
 """
 
 PLAN_PROMPT_TEMPLATE = """\
@@ -86,7 +89,10 @@ Search the codebase to verify what is and isn't implemented. Use as many subagen
 
 Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
 
-When done, output a brief summary (1-3 sentences) of what changed in this iteration. This will be used as the commit message.
+When done, output your final message in this exact format:
+
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>
 """
 
 SPEC_PROMPT_TEMPLATE = """\
@@ -495,11 +501,28 @@ def has_uncommitted_changes() -> bool:
     return staged.returncode != 0 or unstaged.returncode != 0 or bool(untracked.stdout.strip())
 
 
+def parse_title_summary(text: str) -> tuple[str, str]:
+    """Parse TITLE: and SUMMARY: from LLM output. Falls back gracefully."""
+    title = ""
+    summary = ""
+    for line in text.strip().splitlines():
+        if line.strip().upper().startswith("TITLE:"):
+            title = line.strip()[6:].strip()
+        elif line.strip().upper().startswith("SUMMARY:"):
+            summary = line.strip()[8:].strip()
+    # Fallback: use first line as title, rest as summary
+    if not title:
+        lines = text.strip().splitlines()
+        title = lines[0].strip() if lines else "No summary"
+        summary = " ".join(l.strip() for l in lines[1:]).strip() if len(lines) > 1 else ""
+    return title, summary
+
+
 def build_commit_message(
     mode: str,
     iteration: int,
     max_iterations: int,
-    summary: str,
+    result_text: str,
     iter_result: dict,
     model: str,
     stop_reason: str = "",
@@ -507,31 +530,30 @@ def build_commit_message(
     """Build a structured commit message with metrics."""
     label = mode.capitalize()
 
-    # Extract first line of summary as headline
-    lines = summary.strip().splitlines() if summary.strip() else []
-    headline = lines[0].strip().rstrip(".") if lines else "No summary"
-    # Truncate headline to keep commit title readable
-    if len(headline) > 72:
-        headline = headline[:69] + "..."
+    title, summary = parse_title_summary(result_text)
 
-    title = f"{label} ({iteration}/{max_iterations}) - {headline}"
+    # Truncate title to keep commit subject readable
+    if len(title) > 50:
+        title = title[:47] + "..."
 
-    parts = [title, ""]
+    subject = f"{label} ({iteration}/{max_iterations}) - {title}"
+
+    parts = [subject, ""]
 
     if stop_reason:
         parts.append(stop_reason)
         parts.append("")
 
     # Summary
-    if summary.strip():
+    if summary:
         parts.append("## Summary")
         parts.append("")
-        parts.append(summary.strip())
+        parts.append(summary)
         parts.append("")
 
     # Metrics
     plan_tasks = parse_plan_tasks()
-    parts.append("## Iteration Metrics")
+    parts.append("## Metrics")
     parts.append("")
 
     if plan_tasks["total"] > 0:
@@ -541,13 +563,13 @@ def build_commit_message(
         bar = "#" * filled + "-" * (bar_width - filled)
         blocked_str = f" / {plan_tasks['blocked']} blocked" if plan_tasks["blocked"] else ""
         parts.append(f"Progress: [{bar}] {pct:.0f}%")
-        parts.append(f"Tasks: {plan_tasks['done']} done / {plan_tasks['pending']} pending{blocked_str} / {plan_tasks['total']} total")
+        parts.append(f"Tasks:    {plan_tasks['done']} done / {plan_tasks['pending']} pending{blocked_str} / {plan_tasks['total']} total")
 
     parts.append(f"Duration: {fmt_duration(iter_result['duration_s'])}")
-    parts.append(f"Model: {model}")
+    parts.append(f"Model:    {model}")
     if iter_result.get("cost_usd"):
-        parts.append(f"Cost: {fmt_cost(iter_result['cost_usd'])}")
-    parts.append(f"Tokens: {fmt_tokens(iter_result['tokens_in'])} in / {fmt_tokens(iter_result['tokens_out'])} out / {fmt_tokens(iter_result.get('cache_read', 0))} cache")
+        parts.append(f"Cost:     {fmt_cost(iter_result['cost_usd'])}")
+    parts.append(f"Tokens:   {fmt_tokens(iter_result['tokens_in'])} in / {fmt_tokens(iter_result['tokens_out'])} out / {fmt_tokens(iter_result.get('cache_read', 0))} cache")
 
     return "\n".join(parts)
 
