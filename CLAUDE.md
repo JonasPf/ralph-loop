@@ -23,7 +23,7 @@ python loop.py plan -n 5
 python loop.py build
 python loop.py build -n 10
 python loop.py build --no-stop        # don't stop when plan is complete
-python loop.py build --model sonnet   # use a different model (default: opus)
+python loop.py build --model opus     # use a different model (build default: sonnet, plan default: opus)
 ```
 
 ## Prerequisites

@@ -593,7 +593,7 @@ def main() -> int:
               %(prog)s build              Build mode, 20 iterations (default)
               %(prog)s build -n 10        Build mode, max 10 iterations
               %(prog)s build --no-stop    Build mode, don't stop when plan is complete
-              %(prog)s build --model sonnet  Build mode with sonnet model
+              %(prog)s build --model opus    Build mode with opus model
               %(prog)s plan               Plan mode, 10 iterations (default)
               %(prog)s plan -n 5          Plan mode, 5 iterations
         """),
@@ -612,8 +612,8 @@ def main() -> int:
         help="Don't stop when all plan tasks are complete",
     )
     build_parser.add_argument(
-        "--model", default="opus",
-        help="Claude model to use (default: opus)",
+        "--model", default="sonnet",
+        help="Claude model to use (default: sonnet)",
     )
 
     # Plan mode
