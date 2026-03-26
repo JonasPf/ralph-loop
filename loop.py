@@ -575,6 +575,15 @@ def build_commit_message(
         parts.append(f"Cost:     {fmt_cost(iter_result['cost_usd'])}")
     parts.append(f"Tokens:   {fmt_tokens(iter_result['tokens_in'])} in / {fmt_tokens(iter_result['tokens_out'])} out / {fmt_tokens(iter_result.get('cache_read', 0))} cache")
 
+    # Blocked tasks
+    if plan_tasks["blocked"] > 0:
+        parts.append("")
+        parts.append("## Blocked")
+        parts.append("")
+        for task in plan_tasks["tasks"]:
+            if task["status"] == "blocked":
+                parts.append(f"- [B] {task['text']}")
+
     return "\n".join(parts)
 
 
@@ -703,27 +712,27 @@ def main() -> int:
     if mode == "build":
         info(f"Stop on completion: {c(GREEN, 'yes') if stop_on_complete else c(DIM, 'no')}")
 
-    # Show plan status if in build mode
-    if mode == "build":
-        plan_tasks = parse_plan_tasks()
-        if plan_tasks["total"] > 0:
-            section("Implementation Plan")
-            print_plan_summary(plan_tasks)
+    # Show plan status
+    plan_tasks = parse_plan_tasks()
+    if plan_tasks["total"] > 0:
+        section("Implementation Plan")
+        print_plan_summary(plan_tasks)
 
-            # Check for blocked tasks
-            if plan_tasks["blocked"] > 0:
-                print()
-                error(f"{plan_tasks['blocked']} task(s) are blocked and need human intervention:")
-                for task in plan_tasks["tasks"]:
-                    if task["status"] == "blocked":
-                        print(f"      {c(RED, '[B]')} {task['text']}")
-                print()
-                info("Resolve blocked tasks before starting build iterations.")
-                return 1
-        else:
+        if plan_tasks["blocked"] > 0:
             print()
-            warn("No IMPLEMENTATION_PLAN.md found or no tasks in it.")
-            info("Consider running in plan mode first.")
+            warn(f"{plan_tasks['blocked']} task(s) blocked:")
+            for task in plan_tasks["tasks"]:
+                if task["status"] == "blocked":
+                    print(f"      {c(RED, '[B]')} {task['text']}")
+
+        if mode == "build" and plan_tasks["blocked"] > 0:
+            print()
+            error("Resolve blocked tasks before starting build iterations.")
+            return 1
+    elif mode == "build":
+        print()
+        warn("No IMPLEMENTATION_PLAN.md found or no tasks in it.")
+        info("Consider running in plan mode first.")
 
     # ── Run loop ─────────────────────────────────────────────────────────
 
