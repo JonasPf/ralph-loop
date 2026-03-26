@@ -89,6 +89,10 @@ Search the codebase to verify what is and isn't implemented. Use as many subagen
 
 Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
 
+Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
+
+For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
+
 When done, output your final message in this exact format:
 
 TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
@@ -705,6 +709,17 @@ def main() -> int:
         if plan_tasks["total"] > 0:
             section("Implementation Plan")
             print_plan_summary(plan_tasks)
+
+            # Check for blocked tasks
+            if plan_tasks["blocked"] > 0:
+                print()
+                error(f"{plan_tasks['blocked']} task(s) are blocked and need human intervention:")
+                for task in plan_tasks["tasks"]:
+                    if task["status"] == "blocked":
+                        print(f"      {c(RED, '[B]')} {task['text']}")
+                print()
+                info("Resolve blocked tasks before starting build iterations.")
+                return 1
         else:
             print()
             warn("No IMPLEMENTATION_PLAN.md found or no tasks in it.")
