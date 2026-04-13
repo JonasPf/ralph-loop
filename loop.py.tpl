@@ -284,7 +284,8 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         proc = subprocess.Popen(
             [
                 "claude", "-p",
-                "--dangerously-skip-permissions",
+                "--permission-mode acceptEdits",
+                "--bare",
                 "--output-format", "stream-json",
                 "--model", model,
                 "--verbose",
