@@ -34,15 +34,91 @@ BUILD_DEFAULT_ITERATIONS = 20
 # These are inlined from PROMPT_*.md at build time. Edit the .md files, not these.
 
 BUILD_PROMPT_TEMPLATE = """\
-{{BUILD_PROMPT}}\
+Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item and implement it.
+
+## Implementation
+
+Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing. Use as many subagents as needed to parallelize work.
+
+Implement the item fully — no placeholders or stubs. Fix any failures including pre-existing ones.
+
+Use TDD — write tests first, then implement to make them pass. Keep code DRY and lean.
+
+Build, test, and lint. All must pass before proceeding.
+
+## QA
+
+When implementation is complete, spawn a **QA** subagent with a fresh context. Include the task text from the plan in the subagent prompt so it knows what was implemented.
+
+> You are the QA verifier. The task being verified is: `{TASK}`. Your job is to verify that the tests adequately cover the spec.
+>
+> Do NOT read the implementation code — only read the test files and the specs.
+>
+> 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
+> 2. Read the E2E test files in `e2e/` and verify there is at least one E2E test for each acceptance criterion (AC) mentioned in the spec for this feature. If any AC lacks an E2E test, report it as a gap — do not pass QA until every AC has E2E coverage.
+> 3. Run the build, tests, and linter to confirm they pass.
+> 4. Start the app and smoke test the new feature(s) end to end — make real requests, verify responses, check that the feature works as a user would experience it. Don't rely solely on automated tests.
+> 5. If there are gaps in test coverage or smoke test failures, report exactly what is missing or broken.
+> 6. If everything is covered, passing, and works end to end, respond with: `QA PASS`
+>
+> You may add new items to @IMPLEMENTATION_PLAN.md if you discover things that need to be done. You may mark items as `- [B]` (blocked) if they need human intervention. You MUST mark the current item as `- [x]` (done) when all checks pass.
+
+If QA reports failures, fix the issues and re-run the QA subagent (fresh context each time). Repeat until QA passes.
+
+## Completion rules
+
+- A task is only done when the QA subagent passes.
+- Only the QA subagent may mark a task as `- [x]` in IMPLEMENTATION_PLAN.md.
+- Any agent (you or QA) may mark a task as `- [B]` (blocked) with a reason.
+- Any agent may add new items to IMPLEMENTATION_PLAN.md.
+- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
+- If stuck in a fix/verify loop for more than 3 rounds, mark the task `- [B]` and move on.
+- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
+
+When done, output your final message in this exact format:
+
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>\
 """
 
 PLAN_PROMPT_TEMPLATE = """\
-{{PLAN_PROMPT}}\
+Plan only — do NOT implement anything.
+
+Read `specs/*` and @IMPLEMENTATION_PLAN.md (if present; it may be stale or wrong).
+
+Search the codebase to verify what is and isn't implemented. Use as many subagents as needed to parallelize work. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
+
+Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
+
+Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
+
+For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist. Search the `e2e/` directory to check. 
+
+For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
+
+When done, output your final message in this exact format:
+
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>\
 """
 
 SPEC_PROMPT_TEMPLATE = """\
-{{SPEC_PROMPT}}\
+Help me write or update a specification for a software project. If there are already files in ./specs, study them first. Then interview me in detail using the AskUserQuestionTool about anything. Be very in-depth and continue interviewing me until you have all the information needed. Then create a new branch and name it after the features or project I want to build. Then create or update the specifications in ./specs/.
+
+Rules for writing the specification:
+
+0. Keep the specification as concise and succinct as possible. Avoid bloat.
+1. Do not refer to the current state of the project, instead write or update the specs so they are self-contained and can be read and understood without prior knowledge of the project.
+2. Keep the what (Functionality, Use Cases, Acceptance Criteria) seperate from the how (Tech Stack, Architecture). IMPORTANT: A specification is not a plan, do not include specific impmlementation steps.
+3. Use OpenAPI 3.0 to design APIs.
+4. Use mermaid entity relation diagram to document data bases and other data models.
+5. Use mermaid flowcharts or message sequence diagrams to document data flows and system interaction.
+6. Every feature must be documented with acceptance criteria.
+7. Include a requirement for a good test suite consisting of unit tests, integration and e2e tests.
+8. Include a requirment for concise and succinct documentation and a getting started guide in README.md.
+9. Include a requirement for linting the code base.
+
+Once you've written the specification, study it again and point out any inconsistencies, gaps or blindspots. If there are any lets resolve them together.\
 """
 
 # ─── Terminal helpers ─────────────────────────────────────────────────────────

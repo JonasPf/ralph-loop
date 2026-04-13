@@ -9,16 +9,9 @@ This is the **Ralph Wiggum Loop** — a Python script (`loop.py`) that drives Cl
 - **Plan mode**: Reads specs and codebase, generates/updates `IMPLEMENTATION_PLAN.md` as a prioritized checkbox list
 - **Build mode**: Implements items from the plan, then spawns reviewer and QA subagents to verify, commits and repeats
 
-## Architecture
-
-Prompts are maintained as separate markdown files (`PROMPT_build.md`, `PROMPT_plan.md`, `PROMPT_spec.md`). The `build.py` script inlines them into `loop.py` from the template `loop.py.tpl`. Edit the `.md` files, then run `python build.py` to regenerate `loop.py`.
-
 ## Commands
 
 ```bash
-# Build loop.py from template + prompt files
-python build.py
-
 # Initialize — generates PROMPT_plan.md, PROMPT_build.md, PROMPT_spec.md
 python loop.py init
 
@@ -44,7 +37,6 @@ python loop.py build --model opus     # use a different model (build default: so
 
 ## Key Behaviors
 
-- Runs Claude in headless mode (`claude -p --dangerously-skip-permissions --output-format stream-json`)
 - Creates checkpoint commits after each iteration (`git add -A && git commit`)
 - Stops after 2 consecutive iterations with no changes
 - In build mode, stops when all plan tasks are checked off (unless `--no-stop`)
