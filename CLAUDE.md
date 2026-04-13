@@ -9,10 +9,17 @@ This is the **Ralph Wiggum Loop** — a Python script (`loop.py`) that drives Cl
 - **Plan mode**: Reads specs and codebase, generates/updates `IMPLEMENTATION_PLAN.md` as a prioritized checkbox list
 - **Build mode**: Implements items from the plan, then spawns reviewer and QA subagents to verify, commits and repeats
 
+## Architecture
+
+Prompts are maintained as separate markdown files (`PROMPT_build.md`, `PROMPT_plan.md`, `PROMPT_spec.md`). The `build.py` script inlines them into `loop.py` from the template `loop.py.tpl`. Edit the `.md` files, then run `python build.py` to regenerate `loop.py`.
+
 ## Commands
 
 ```bash
-# Initialize — generates PROMPT_plan.md, PROMPT_build.md, updates .gitignore
+# Build loop.py from template + prompt files
+python build.py
+
+# Initialize — generates PROMPT_plan.md, PROMPT_build.md, PROMPT_spec.md
 python loop.py init
 
 # Plan mode (default 10 iterations)
@@ -31,7 +38,8 @@ python loop.py build --model opus     # use a different model (build default: so
 - Claude CLI must be installed and on PATH
 - Must be run inside a git repository with a clean worktree
 - Auto-compact must be disabled: `claude config set autoCompact false`
-- Prompt files (`PROMPT_plan.md` / `PROMPT_build.md`) must exist (created by `init`)
+- Prompt files (`PROMPT_plan.md` / `PROMPT_build.md`) must exist (created by `init` or manually)
+- Run `python build.py` after editing any `PROMPT_*.md` file
 - A `specs/` directory with application specifications is expected
 
 ## Key Behaviors
