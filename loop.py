@@ -532,6 +532,25 @@ def has_uncommitted_changes() -> bool:
     return staged.returncode != 0 or unstaged.returncode != 0 or bool(untracked.stdout.strip())
 
 
+# Per-iteration log files the loop writes itself — changes to these don't count as progress.
+LOOP_ARTIFACT_FILES = {STREAM_LOG, THINKING_LOG}
+
+
+def has_substantive_changes() -> bool:
+    """Return True if anything changed besides the loop's own per-iteration log files."""
+    result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return True  # be conservative — treat as progress rather than stopping early
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip().strip('"')
+        # Renames show "old -> new"; those obviously aren't artifact files.
+        if path not in LOOP_ARTIFACT_FILES:
+            return True
+    return False
+
+
 def parse_title_summary(text: str) -> tuple[str, str]:
     """Parse TITLE: and SUMMARY: from LLM output. Falls back gracefully."""
     title = ""
@@ -772,10 +791,10 @@ def main() -> int:
                 success(f"Reached max iterations ({max_iterations}). Stopping.")
                 break
 
-            # Check if no changes for 2 consecutive iterations
+            # Check if no substantive changes for 2 consecutive iterations
             if consecutive_no_changes >= 2:
                 print()
-                warn("No changes detected in the last 2 iterations. Stopping.")
+                warn("No substantive changes in the last 2 iterations. Stopping.")
                 break
 
             # In build mode, check if plan is complete or only blocked items remain
@@ -841,15 +860,18 @@ def main() -> int:
 
             print_running_totals(iteration, totals)
 
-            # Commit
+            # Commit — always commit so the per-iteration logs are captured, but
+            # only the changes outside THINKING.md / stream.jsonl count as progress.
+            substantive = has_substantive_changes()
             if has_uncommitted_changes():
                 subprocess.run(["git", "add", "-A"], capture_output=True)
                 subprocess.run(["git", "commit", "-m", msg], capture_output=True)
+                success("Committed." if substantive else "Committed (logs only).")
+            if substantive:
                 consecutive_no_changes = 0
-                success("Committed.")
             else:
                 consecutive_no_changes += 1
-                info(f"No changes to commit ({consecutive_no_changes} consecutive iteration{'s' if consecutive_no_changes != 1 else ''} without changes)")
+                info(f"No substantive changes ({consecutive_no_changes} consecutive iteration{'s' if consecutive_no_changes != 1 else ''} without changes)")
 
 
     except KeyboardInterrupt:
@@ -880,6 +902,12 @@ def main() -> int:
 
     head_final = get_git_head()
     info(f"HEAD: {c(DIM, head_final)}")
+    print()
+
+    section("⚠  Before you push")
+    warn(f"Each iteration commits the raw Claude logs ({THINKING_LOG} / {STREAM_LOG}).")
+    warn("These can contain secrets, credentials, or file contents from this run.")
+    warn("Review the commits (and consider squashing/rebasing) before pushing anywhere.")
     print()
 
     return 0

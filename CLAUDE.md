@@ -37,7 +37,7 @@ python loop.py build --model opus     # use a different model (build default: so
 ## Key Behaviors
 
 - Creates checkpoint commits after each iteration (`git add -A && git commit`)
-- Stops after 2 consecutive iterations with no changes
+- Stops after 2 consecutive iterations with no substantive changes (changes to the per-iteration log files `THINKING.md` / `stream.jsonl` don't count)
 - In build mode, stops when all plan tasks are checked off (unless `--no-stop`)
 - Disables Claude's auto-memory via `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`
 - Spawns reviewer and QA subagents (fresh context each) to verify work before marking tasks complete
