@@ -30,7 +30,6 @@ python loop.py build --model opus     # use a different model (build default: so
 
 - Claude CLI must be installed and on PATH
 - Must be run inside a git repository with a clean worktree
-- Auto-compact must be disabled: `claude config set autoCompact false`
 - Prompt files (`PROMPT_plan.md` / `PROMPT_build.md`) must exist (created by `init` or manually)
 - Run `python build.py` after editing any `PROMPT_*.md` file
 - A `specs/` directory with application specifications is expected

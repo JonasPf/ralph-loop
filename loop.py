@@ -31,7 +31,7 @@ PLAN_DEFAULT_ITERATIONS = 10
 BUILD_DEFAULT_ITERATIONS = 20
 
 # ─── Prompt templates ────────────────────────────────────────────────────────
-# These are inlined from PROMPT_*.md at build time. Edit the .md files, not these.
+# These are the source of truth for the prompts. Edit them here.
 
 BUILD_PROMPT_TEMPLATE = """\
 Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item and implement it.
@@ -55,13 +55,11 @@ When implementation is complete, spawn a **QA** subagent with a fresh context. I
 > Do NOT read the implementation code — only read the test files and the specs.
 >
 > 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
-> 2. Read the E2E test files in `e2e/` and verify there is at least one E2E test for each acceptance criterion (AC) mentioned in the spec for this feature. If any AC lacks an E2E test, report it as a gap — do not pass QA until every AC has E2E coverage.
+> 2. Read the E2E test files and verify there is at least one E2E test for each acceptance criterion (AC) mentioned in the spec for this feature. If any AC lacks an E2E test, report it as a gap — do not pass QA until every AC has E2E coverage.
 > 3. Run the build, tests, and linter to confirm they pass.
 > 4. Start the app and smoke test the new feature(s) end to end — make real requests, verify responses, check that the feature works as a user would experience it. Don't rely solely on automated tests.
 > 5. If there are gaps in test coverage or smoke test failures, report exactly what is missing or broken.
 > 6. If everything is covered, passing, and works end to end, respond with: `QA PASS`
->
-> You may add new items to @IMPLEMENTATION_PLAN.md if you discover things that need to be done. You may mark items as `- [B]` (blocked) if they need human intervention. You MUST mark the current item as `- [x]` (done) when all checks pass.
 
 If QA reports failures, fix the issues and re-run the QA subagent (fresh context each time). Repeat until QA passes.
 
@@ -69,10 +67,10 @@ If QA reports failures, fix the issues and re-run the QA subagent (fresh context
 
 - A task is only done when the QA subagent passes.
 - Only the QA subagent may mark a task as `- [x]` in IMPLEMENTATION_PLAN.md.
-- Any agent (you or QA) may mark a task as `- [B]` (blocked) with a reason.
+- Any agent may mark a task as `- [B]` (blocked) with a reason.
 - Any agent may add new items to IMPLEMENTATION_PLAN.md.
 - If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
-- If stuck in a fix/verify loop for more than 3 rounds, mark the task `- [B]` and move on.
+- If stuck in a fix/verify loop for more than 6 rounds, mark the task `- [B]` and move on.
 - Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
 
 When done, output your final message in this exact format:
@@ -92,7 +90,7 @@ Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` p
 
 Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
 
-For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist. Search the `e2e/` directory to check. 
+For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist.
 
 For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
 
@@ -103,20 +101,19 @@ SUMMARY: <1-3 sentence description of what changed and why>\
 """
 
 SPEC_PROMPT_TEMPLATE = """\
-Help me write or update a specification for a software project. If there are already files in ./specs, study them first. Then interview me in detail using the AskUserQuestionTool about anything. Be very in-depth and continue interviewing me until you have all the information needed. Then create a new branch and name it after the features or project I want to build. Then create or update the specifications in ./specs/.
+Help me write or update a specification for a software project. If there are already files in ./specs, study them first. Then interview me in detail using the AskUserQuestionTool about anything. Be very in-depth and continue interviewing me until you have all the information needed. Then create or update the specifications in ./specs/.
 
 Rules for writing the specification:
 
 0. Keep the specification as concise and succinct as possible. Avoid bloat.
 1. Do not refer to the current state of the project, instead write or update the specs so they are self-contained and can be read and understood without prior knowledge of the project.
-2. Keep the what (Functionality, Use Cases, Acceptance Criteria) seperate from the how (Tech Stack, Architecture). IMPORTANT: A specification is not a plan, do not include specific impmlementation steps.
+2. A specification is not a plan, do not include specific impmlementation steps.
 3. Use OpenAPI 3.0 to design APIs.
-4. Use mermaid entity relation diagram to document data bases and other data models.
+4. Use mermaid entity relation diagram to document databases and other data models.
 5. Use mermaid flowcharts or message sequence diagrams to document data flows and system interaction.
-6. Every feature must be documented with acceptance criteria.
-7. Include a requirement for a good test suite consisting of unit tests, integration and e2e tests.
-8. Include a requirment for concise and succinct documentation and a getting started guide in README.md.
-9. Include a requirement for linting the code base.
+6. Every feature must be documented with acceptance criteria and an e2e test plan.
+7. Include a requirement for concise and succinct documentation and a getting started guide in README.md.
+8. Include a requirement for linting the code base.
 
 Once you've written the specification, study it again and point out any inconsistencies, gaps or blindspots. If there are any lets resolve them together.\
 """
@@ -222,32 +219,6 @@ def check_clean_worktree() -> bool:
     return clean
 
 
-def check_auto_compact() -> bool:
-    """Return True if auto-compact is disabled (safe to proceed).
-
-    Checks ~/.claude.json for autoCompactEnabled. When false, auto-compact
-    is disabled. Any other value (or missing key) means it's enabled and
-    will interfere with the loop.
-    """
-    path = Path.home() / ".claude.json"
-    try:
-        data = json.loads(path.read_text())
-        if data.get("autoCompactEnabled") is False:
-            return True
-    except (json.JSONDecodeError, OSError, FileNotFoundError):
-        pass
-
-    error("Auto-compact is enabled (or not explicitly disabled)")
-    print()
-    info("Auto-compact interferes with the ralph wiggum loop by")
-    info("compacting context mid-iteration, which can cause the")
-    info("agent to lose track of what it was doing.")
-    print()
-    info("Disable it by running:")
-    print(f"      {c(BOLD, 'claude config set autoCompact false')}")
-    print()
-    return False
-
 def check_prompt_file(prompt_file: str) -> bool:
     """Verify the prompt file exists."""
     if not Path(prompt_file).exists():
@@ -332,8 +303,29 @@ def get_git_branch() -> str:
 
 
 
+STREAM_LOG = "stream.jsonl"
+THINKING_LOG = "THINKING.md"
+
+
+def _tool_hint(name: str, inp: dict) -> str:
+    """Extract a short, readable hint from a tool_use input block."""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("file_path", "path", "pattern", "command", "description", "query", "url", "prompt"):
+        if key in inp:
+            val = str(inp[key]).replace("\n", " ")
+            if len(val) > 120:
+                val = val[:117] + "..."
+            return val
+    return ""
+
+
 def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
     """Run a single Claude CLI iteration and parse the streaming JSON output.
+
+    Also writes two log files (overwritten each iteration):
+      - stream.jsonl: raw stream-json events
+      - THINKING.md:  human-readable assistant text + tool calls
 
     Returns dict with: success, tokens_in, tokens_out, duration_s, error.
     """
@@ -352,7 +344,14 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         "error": None,
     }
 
+    raw_f = None
+    think_f = None
     try:
+        raw_f = open(STREAM_LOG, "w")
+        think_f = open(THINKING_LOG, "w")
+        think_f.write(f"# Claude thinking log\n\n_Model: {model} — prompt: {prompt_file}_\n\n---\n\n")
+        think_f.flush()
+
         env = {
             **os.environ,
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
@@ -360,11 +359,10 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         proc = subprocess.Popen(
             [
                 "claude", "-p",
-                "--permission-mode acceptEdits",
-                "--bare",
+                "--permission-mode", "acceptEdits",
                 "--output-format", "stream-json",
                 "--model", model,
-                "--verbose",
+                "--verbose"
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -373,34 +371,50 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
             env=env,
         )
 
-        stdout, stderr = proc.communicate(input=prompt_text)
-        result_data["duration_s"] = time.monotonic() - start
+        # Prompt is small — write and close stdin before reading stdout.
+        proc.stdin.write(prompt_text)
+        proc.stdin.close()
 
-        # Parse streaming JSON — each line is a JSON object
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
+        for line in proc.stdout:
+            raw_f.write(line)
+            raw_f.flush()
+
+            line_s = line.strip()
+            if not line_s:
                 continue
             try:
-                event = json.loads(line)
+                event = json.loads(line_s)
             except json.JSONDecodeError:
                 continue
 
             etype = event.get("type", "")
 
-            # Collect assistant text output
             if etype == "assistant" and "message" in event:
                 for block in event["message"].get("content", []):
-                    if block.get("type") == "text":
-                        result_data["result_text"] += block["text"]
+                    btype = block.get("type")
+                    if btype == "text":
+                        text = block.get("text", "")
+                        result_data["result_text"] += text
+                        if text.strip():
+                            think_f.write(text + "\n\n")
+                    elif btype == "thinking":
+                        thought = block.get("thinking", "").strip()
+                        if thought:
+                            think_f.write(f"> _thinking:_ {thought}\n\n")
+                    elif btype == "tool_use":
+                        tname = block.get("name", "?")
+                        hint = _tool_hint(tname, block.get("input", {}))
+                        if hint:
+                            think_f.write(f"**[{tname}]** `{hint}`\n\n")
+                        else:
+                            think_f.write(f"**[{tname}]**\n\n")
+                think_f.flush()
 
-            # Collect usage from the result event
-            if etype == "result":
+            elif etype == "result":
                 result_data["cost_usd"] = event.get("total_cost_usd", 0)
                 result_data["result_text"] = event.get("result", result_data["result_text"])
                 result_data["success"] = True
 
-                # modelUsage has cumulative per-model totals
                 model_usage = event.get("modelUsage", {})
                 tokens_in = 0
                 tokens_out = 0
@@ -416,6 +430,10 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
                 result_data["cache_read"] = cache_read
                 result_data["cache_creation"] = cache_creation
 
+        proc.wait()
+        stderr = proc.stderr.read()
+        result_data["duration_s"] = time.monotonic() - start
+
         if proc.returncode != 0 and not result_data["success"]:
             result_data["error"] = stderr.strip() or f"Claude exited with code {proc.returncode}"
 
@@ -423,6 +441,11 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         result_data["error"] = "Claude CLI not found. Is it installed and on PATH?"
     except Exception as e:
         result_data["error"] = str(e)
+    finally:
+        if raw_f is not None:
+            raw_f.close()
+        if think_f is not None:
+            think_f.close()
 
     return result_data
 
@@ -684,19 +707,7 @@ def main() -> int:
         return 1
     success("Working tree is clean")
 
-    # 3. Auto-compact
-    if not check_auto_compact():
-        return 1
-    success("Auto-compact is not enabled")
-
-    # 4. CLAUDE.md
-    if not Path("CLAUDE.md").exists():
-        error("CLAUDE.md not found.")
-        info("Create a CLAUDE.md file before starting the loop.")
-        return 1
-    success("CLAUDE.md found")
-
-    # 5. Prompt file
+    # 3. Prompt file
     if not check_prompt_file(prompt_file):
         return 1
     success(f"Prompt file found: {prompt_file}")
