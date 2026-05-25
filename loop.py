@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Ralph Wiggum Loop — Python implementation.
 
-Drives Claude Code in a loop, feeding it a prompt file each iteration.
-Supports plan mode (generate/update IMPLEMENTATION_PLAN.md) and build mode
-(implement from plan, commit, repeat).
+Drives a coding agent (Claude Code, or pi via --agent pi) in a loop, feeding it
+a prompt file each iteration. Supports plan mode (generate/update
+IMPLEMENTATION_PLAN.md) and build mode (implement from plan, commit, repeat).
 
 Usage:
     loop.py [plan|build] [OPTIONS]
@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -25,6 +26,10 @@ from pathlib import Path
 PLAN_PROMPT = "PROMPT_plan.md"
 BUILD_PROMPT = "PROMPT_build.md"
 SPEC_PROMPT = "PROMPT_spec.md"
+# Pi-specific prompt variants — pi has no subagent/Task tool, so these fold QA
+# inline and drop the parallel-subagent instructions.
+PLAN_PROMPT_PI = "PROMPT_plan_pi.md"
+BUILD_PROMPT_PI = "PROMPT_build_pi.md"
 IMPLEMENTATION_PLAN = "IMPLEMENTATION_PLAN.md"
 
 PLAN_DEFAULT_ITERATIONS = 10
@@ -116,6 +121,71 @@ Rules for writing the specification:
 8. Include a requirement for linting the code base.
 
 Once you've written the specification, study it again and point out any inconsistencies, gaps or blindspots. If there are any lets resolve them together.\
+"""
+
+# ─── Pi prompt templates ───────────────────────────────────────────────────────
+# Variants for the `pi` agent, which has no subagent/Task tool. QA and review are
+# done inline in the same context; parallel-subagent instructions are removed.
+
+BUILD_PROMPT_PI_TEMPLATE = """\
+Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item and implement it.
+
+## Implementation
+
+Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing.
+
+Implement the item fully — no placeholders or stubs. Fix any failures including pre-existing ones.
+
+Use TDD — write tests first, then implement to make them pass. Keep code DRY and lean.
+
+Build, test, and lint. All must pass before proceeding.
+
+## QA
+
+When implementation is complete, do a QA pass on your own work. The task being verified is the plan item you just implemented.
+
+1. Re-read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
+2. Check the E2E test files and verify there is at least one E2E test for each acceptance criterion (AC) mentioned in the spec for this feature. If any AC lacks an E2E test, add it — do not consider QA complete until every AC has E2E coverage.
+3. Run the build, tests, and linter to confirm they pass.
+4. Start the app and smoke test the new feature(s) end to end — make real requests, verify responses, check that the feature works as a user would experience it. Don't rely solely on automated tests.
+5. If there are gaps in test coverage or smoke test failures, fix them and repeat the QA pass.
+
+Repeat the QA pass until everything is covered, passing, and works end to end.
+
+## Completion rules
+
+- Mark a task `- [x]` in IMPLEMENTATION_PLAN.md only after the QA pass above succeeds.
+- Mark a task `- [B]` (blocked) with a reason if it cannot be completed.
+- Add new items to IMPLEMENTATION_PLAN.md as needed.
+- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
+- If stuck in a fix/verify loop for more than 6 rounds, mark the task `- [B]` and move on.
+- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
+
+When done, output your final message in this exact format:
+
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>\
+"""
+
+PLAN_PROMPT_PI_TEMPLATE = """\
+Plan only — do NOT implement anything.
+
+Read `specs/*` and @IMPLEMENTATION_PLAN.md (if present; it may be stale or wrong).
+
+Search the codebase to verify what is and isn't implemented. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
+
+Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
+
+Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
+
+For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist.
+
+For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
+
+When done, output your final message in this exact format:
+
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>\
 """
 
 # ─── Terminal helpers ─────────────────────────────────────────────────────────
@@ -228,6 +298,14 @@ def check_prompt_file(prompt_file: str) -> bool:
     return True
 
 
+def check_agent_installed(agent: str) -> bool:
+    """Verify the selected agent CLI is on PATH."""
+    if shutil.which(agent) is None:
+        error(f"{agent} CLI not found. Is it installed and on PATH?")
+        return False
+    return True
+
+
 # ─── Plan parsing ─────────────────────────────────────────────────────────────
 
 
@@ -320,11 +398,82 @@ def _tool_hint(name: str, inp: dict) -> str:
     return ""
 
 
-def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
-    """Run a single Claude CLI iteration and parse the streaming JSON output.
+def _handle_claude_event(event: dict, result_data: dict, think_f) -> None:
+    """Parse one claude stream-json event into result_data + THINKING.md."""
+    etype = event.get("type", "")
 
-    Also writes two log files (overwritten each iteration):
-      - stream.jsonl: raw stream-json events
+    if etype == "assistant" and "message" in event:
+        for block in event["message"].get("content", []):
+            btype = block.get("type")
+            if btype == "text":
+                text = block.get("text", "")
+                result_data["result_text"] += text
+                if text.strip():
+                    think_f.write(text + "\n\n")
+            elif btype == "thinking":
+                thought = block.get("thinking", "").strip()
+                if thought:
+                    think_f.write(f"> _thinking:_ {thought}\n\n")
+            elif btype == "tool_use":
+                tname = block.get("name", "?")
+                hint = _tool_hint(tname, block.get("input", {}))
+                if hint:
+                    think_f.write(f"**[{tname}]** `{hint}`\n\n")
+                else:
+                    think_f.write(f"**[{tname}]**\n\n")
+        think_f.flush()
+
+    elif etype == "result":
+        result_data["cost_usd"] = event.get("total_cost_usd", 0)
+        result_data["result_text"] = event.get("result", result_data["result_text"])
+        result_data["success"] = True
+
+        model_usage = event.get("modelUsage", {})
+        tokens_in = tokens_out = cache_read = cache_creation = 0
+        for model_stats in model_usage.values():
+            tokens_in += model_stats.get("inputTokens", 0)
+            tokens_out += model_stats.get("outputTokens", 0)
+            cache_read += model_stats.get("cacheReadInputTokens", 0)
+            cache_creation += model_stats.get("cacheCreationInputTokens", 0)
+        result_data["tokens_in"] = tokens_in
+        result_data["tokens_out"] = tokens_out
+        result_data["cache_read"] = cache_read
+        result_data["cache_creation"] = cache_creation
+
+
+def _handle_pi_event(event: dict, result_data: dict, think_f) -> None:
+    """Parse one pi `--mode json` event into result_data + THINKING.md (best-effort).
+
+    Pi's JSON schema is only partially documented: token usage, cost, and the
+    thinking/reasoning delta type are not specified, so those stay at zero.
+    TODO(pi): wire up tokens/cost/thinking once verified against a real pi run.
+    """
+    etype = event.get("type", "")
+
+    if etype == "message_update":
+        ame = event.get("assistantMessageEvent", {})
+        if ame.get("type") == "text_delta":
+            delta = ame.get("delta", "")
+            result_data["result_text"] += delta
+            think_f.write(delta)
+            think_f.flush()
+
+    elif etype == "tool_execution_start":
+        tname = event.get("toolName", "?")
+        hint = _tool_hint(tname, event.get("args", {}))
+        if hint:
+            think_f.write(f"\n**[{tname}]** `{hint}`\n\n")
+        else:
+            think_f.write(f"\n**[{tname}]**\n\n")
+        think_f.flush()
+
+
+def run_agent_iteration(prompt_file: str, model: str = "opus", agent: str = "claude") -> dict:
+    """Run a single agent CLI iteration and parse its streaming JSON output.
+
+    `agent` selects the backend ("claude" or "pi"). Writes two log files
+    (overwritten each iteration):
+      - stream.jsonl: raw streaming JSON events
       - THINKING.md:  human-readable assistant text + tool calls
 
     Returns dict with: success, tokens_in, tokens_out, duration_s, error.
@@ -344,36 +493,45 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
         "error": None,
     }
 
+    if agent == "pi":
+        # pi takes the prompt as an argv argument (piped stdin is treated as file
+        # content), emits events via --mode json, and resolves --model itself.
+        cmd = ["pi", "-p", prompt_text, "--mode", "json", "--model", model]
+        env = {**os.environ, "PI_SKIP_VERSION_CHECK": "1"}
+        handle_event = _handle_pi_event
+    else:
+        cmd = [
+            "claude", "-p",
+            "--permission-mode", "acceptEdits",
+            "--output-format", "stream-json",
+            "--model", model,
+            "--verbose",
+        ]
+        env = {**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+        handle_event = _handle_claude_event
+
     raw_f = None
     think_f = None
     try:
         raw_f = open(STREAM_LOG, "w")
         think_f = open(THINKING_LOG, "w")
-        think_f.write(f"# Claude thinking log\n\n_Model: {model} — prompt: {prompt_file}_\n\n---\n\n")
+        think_f.write(f"# {agent} thinking log\n\n_Model: {model} — prompt: {prompt_file}_\n\n---\n\n")
         think_f.flush()
 
-        env = {
-            **os.environ,
-            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
-        }
         proc = subprocess.Popen(
-            [
-                "claude", "-p",
-                "--permission-mode", "acceptEdits",
-                "--output-format", "stream-json",
-                "--model", model,
-                "--verbose"
-            ],
-            stdin=subprocess.PIPE,
+            cmd,
+            # claude reads the prompt from stdin; pi gets it as an argv arg.
+            stdin=subprocess.PIPE if agent == "claude" else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=env,
         )
 
-        # Prompt is small — write and close stdin before reading stdout.
-        proc.stdin.write(prompt_text)
-        proc.stdin.close()
+        if agent == "claude":
+            # Prompt is small — write and close stdin before reading stdout.
+            proc.stdin.write(prompt_text)
+            proc.stdin.close()
 
         for line in proc.stdout:
             raw_f.write(line)
@@ -387,58 +545,21 @@ def run_claude_iteration(prompt_file: str, model: str = "opus") -> dict:
             except json.JSONDecodeError:
                 continue
 
-            etype = event.get("type", "")
-
-            if etype == "assistant" and "message" in event:
-                for block in event["message"].get("content", []):
-                    btype = block.get("type")
-                    if btype == "text":
-                        text = block.get("text", "")
-                        result_data["result_text"] += text
-                        if text.strip():
-                            think_f.write(text + "\n\n")
-                    elif btype == "thinking":
-                        thought = block.get("thinking", "").strip()
-                        if thought:
-                            think_f.write(f"> _thinking:_ {thought}\n\n")
-                    elif btype == "tool_use":
-                        tname = block.get("name", "?")
-                        hint = _tool_hint(tname, block.get("input", {}))
-                        if hint:
-                            think_f.write(f"**[{tname}]** `{hint}`\n\n")
-                        else:
-                            think_f.write(f"**[{tname}]**\n\n")
-                think_f.flush()
-
-            elif etype == "result":
-                result_data["cost_usd"] = event.get("total_cost_usd", 0)
-                result_data["result_text"] = event.get("result", result_data["result_text"])
-                result_data["success"] = True
-
-                model_usage = event.get("modelUsage", {})
-                tokens_in = 0
-                tokens_out = 0
-                cache_read = 0
-                cache_creation = 0
-                for model_stats in model_usage.values():
-                    tokens_in += model_stats.get("inputTokens", 0)
-                    tokens_out += model_stats.get("outputTokens", 0)
-                    cache_read += model_stats.get("cacheReadInputTokens", 0)
-                    cache_creation += model_stats.get("cacheCreationInputTokens", 0)
-                result_data["tokens_in"] = tokens_in
-                result_data["tokens_out"] = tokens_out
-                result_data["cache_read"] = cache_read
-                result_data["cache_creation"] = cache_creation
+            handle_event(event, result_data, think_f)
 
         proc.wait()
         stderr = proc.stderr.read()
         result_data["duration_s"] = time.monotonic() - start
 
+        # Pi has no terminal "result" event to flip success — use the exit code.
+        if agent == "pi" and proc.returncode == 0:
+            result_data["success"] = True
+
         if proc.returncode != 0 and not result_data["success"]:
-            result_data["error"] = stderr.strip() or f"Claude exited with code {proc.returncode}"
+            result_data["error"] = stderr.strip() or f"{agent} exited with code {proc.returncode}"
 
     except FileNotFoundError:
-        result_data["error"] = "Claude CLI not found. Is it installed and on PATH?"
+        result_data["error"] = f"{agent} CLI not found. Is it installed and on PATH?"
     except Exception as e:
         result_data["error"] = str(e)
     finally:
@@ -502,6 +623,8 @@ def init_project() -> int:
         BUILD_PROMPT: BUILD_PROMPT_TEMPLATE,
         PLAN_PROMPT: PLAN_PROMPT_TEMPLATE,
         SPEC_PROMPT: SPEC_PROMPT_TEMPLATE,
+        BUILD_PROMPT_PI: BUILD_PROMPT_PI_TEMPLATE,
+        PLAN_PROMPT_PI: PLAN_PROMPT_PI_TEMPLATE,
     }
 
     for filename, content in files.items():
@@ -575,6 +698,7 @@ def build_commit_message(
     result_text: str,
     iter_result: dict,
     model: str,
+    agent: str = "claude",
     stop_reason: str = "",
 ) -> str:
     """Build a structured commit message with metrics."""
@@ -616,6 +740,7 @@ def build_commit_message(
         parts.append(f"Tasks:    {plan_tasks['done']} done / {plan_tasks['pending']} pending{blocked_str} / {plan_tasks['total']} total")
 
     parts.append(f"Duration: {fmt_duration(iter_result['duration_s'])}")
+    parts.append(f"Agent:    {agent}")
     parts.append(f"Model:    {model}")
     if iter_result.get("cost_usd"):
         parts.append(f"Cost:     {fmt_cost(iter_result['cost_usd'])}")
@@ -668,7 +793,11 @@ def main() -> int:
     )
     build_parser.add_argument(
         "--model", default="sonnet",
-        help="Claude model to use (default: sonnet)",
+        help="Model to use (default: sonnet)",
+    )
+    build_parser.add_argument(
+        "--agent", choices=["claude", "pi"], default="claude",
+        help="Coding agent backend to drive (default: claude)",
     )
 
     # Plan mode
@@ -679,7 +808,11 @@ def main() -> int:
     )
     plan_parser.add_argument(
         "--model", default="opus",
-        help="Claude model to use (default: opus)",
+        help="Model to use (default: opus)",
+    )
+    plan_parser.add_argument(
+        "--agent", choices=["claude", "pi"], default="claude",
+        help="Coding agent backend to drive (default: claude)",
     )
 
     # Init mode
@@ -701,9 +834,13 @@ def main() -> int:
     mode = args.mode
     max_iterations = args.max_iterations
     model = args.model
+    agent = args.agent
     stop_on_complete = mode == "build" and not getattr(args, "no_stop", False)
 
-    prompt_file = PLAN_PROMPT if mode == "plan" else BUILD_PROMPT
+    if agent == "pi":
+        prompt_file = PLAN_PROMPT_PI if mode == "plan" else BUILD_PROMPT_PI
+    else:
+        prompt_file = PLAN_PROMPT if mode == "plan" else BUILD_PROMPT
 
     # ── Precondition checks ──────────────────────────────────────────────
 
@@ -726,7 +863,12 @@ def main() -> int:
         return 1
     success("Working tree is clean")
 
-    # 3. Prompt file
+    # 3. Agent CLI on PATH
+    if not check_agent_installed(agent):
+        return 1
+    success(f"{agent} CLI found")
+
+    # 4. Prompt file
     if not check_prompt_file(prompt_file):
         return 1
     success(f"Prompt file found: {prompt_file}")
@@ -738,6 +880,7 @@ def main() -> int:
 
     section("Configuration")
     info(f"Mode:       {c(BOLD, mode.upper())}")
+    info(f"Agent:      {c(BOLD, agent)}")
     info(f"Model:      {c(BOLD, model)}")
     info(f"Branch:     {c(CYAN, branch)}")
     info(f"Head:       {c(DIM, head)}")
@@ -819,7 +962,7 @@ def main() -> int:
 
             print()
             print(c(CYAN, f"  {'─' * 50}"))
-            print(c(BOLD, f"  {iter_label}  ({mode.upper()})  model={model}"))
+            print(c(BOLD, f"  {iter_label}  ({mode.upper()})  agent={agent} model={model}"))
             print(c(CYAN, f"  {'─' * 50}"))
 
             if mode == "build":
@@ -827,15 +970,15 @@ def main() -> int:
                 if plan_tasks["total"] > 0:
                     print_plan_summary(plan_tasks)
 
-            # ── Run Claude ───────────────────────────────────────────────
+            # ── Run agent ────────────────────────────────────────────────
 
-            info("Running Claude...")
+            info(f"Running {agent}...")
             print()
 
-            iter_result = run_claude_iteration(prompt_file, model)
+            iter_result = run_agent_iteration(prompt_file, model, agent)
 
             if not iter_result["success"]:
-                error(f"Claude iteration failed: {iter_result.get('error', 'unknown error')}")
+                error(f"{agent} iteration failed: {iter_result.get('error', 'unknown error')}")
                 if iteration == 1:
                     return 1
                 warn("Continuing to next iteration...")
@@ -849,7 +992,7 @@ def main() -> int:
 
             # ── Build report & commit ─────────────────────────────────────
 
-            msg = build_commit_message(mode, iteration, max_iterations, iter_result.get("result_text", ""), iter_result, model)
+            msg = build_commit_message(mode, iteration, max_iterations, iter_result.get("result_text", ""), iter_result, model, agent)
 
             # Print the same message that goes into the commit
             print()
