@@ -3,10 +3,10 @@
 
 Drives a coding agent (Claude Code, or pi via --agent pi) in a loop, feeding it
 a prompt file each iteration. Supports plan mode (generate/update
-IMPLEMENTATION_PLAN.md) and build mode (implement from plan, commit, repeat).
+IMPLEMENTATION_PLAN.md) and build mode (one task per iteration with QA).
 
 Usage:
-    loop.py [plan|build] [OPTIONS]
+    loop.py [plan|build|init] [OPTIONS]
     loop.py --help
 """
 
@@ -19,116 +19,27 @@ import subprocess
 import sys
 import textwrap
 import time
+from datetime import datetime
 from pathlib import Path
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 PLAN_PROMPT = "PROMPT_plan.md"
 BUILD_PROMPT = "PROMPT_build.md"
+QA_PROMPT = "PROMPT_qa.md"
+FIX_PROMPT = "PROMPT_fix.md"
 SPEC_PROMPT = "PROMPT_spec.md"
-# Pi-specific prompt variants — pi has no subagent/Task tool, so these fold QA
-# inline and drop the parallel-subagent instructions.
-PLAN_PROMPT_PI = "PROMPT_plan_pi.md"
-BUILD_PROMPT_PI = "PROMPT_build_pi.md"
 IMPLEMENTATION_PLAN = "IMPLEMENTATION_PLAN.md"
+LOGS_ROOT = Path(".ralph/logs")
 
 PLAN_DEFAULT_ITERATIONS = 10
 BUILD_DEFAULT_ITERATIONS = 20
+QA_DEFAULT_MAX_ATTEMPTS = 3
 
 # ─── Prompt templates ────────────────────────────────────────────────────────
-# These are the source of truth for the prompts. Edit them here.
 
 BUILD_PROMPT_TEMPLATE = """\
-Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item and implement it.
-
-## Implementation
-
-Read the relevant specs in `specs/*`. Search the codebase before assuming anything is missing. Use as many subagents as needed to parallelize work.
-
-Implement the item fully — no placeholders or stubs. Fix any failures including pre-existing ones.
-
-Use TDD — write tests first, then implement to make them pass. Keep code DRY and lean.
-
-Build, test, and lint. All must pass before proceeding.
-
-## QA
-
-When implementation is complete, spawn a **QA** subagent with a fresh context. Include the task text from the plan in the subagent prompt so it knows what was implemented.
-
-> You are the QA verifier. The task being verified is: `{TASK}`. Your job is to verify that the tests adequately cover the spec.
->
-> Do NOT read the implementation code — only read the test files and the specs.
->
-> 1. Read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
-> 2. Read the E2E test files and verify there is at least one E2E test for each acceptance criterion (AC) mentioned in the spec for this feature. If any AC lacks an E2E test, report it as a gap — do not pass QA until every AC has E2E coverage.
-> 3. Run the build, tests, and linter to confirm they pass.
-> 4. Start the app and smoke test the new feature(s) end to end — make real requests, verify responses, check that the feature works as a user would experience it. Don't rely solely on automated tests.
-> 5. If there are gaps in test coverage or smoke test failures, report exactly what is missing or broken.
-> 6. If everything is covered, passing, and works end to end, respond with: `QA PASS`
-
-If QA reports failures, fix the issues and re-run the QA subagent (fresh context each time). Repeat until QA passes.
-
-## Completion rules
-
-- A task is only done when the QA subagent passes.
-- Only the QA subagent may mark a task as `- [x]` in IMPLEMENTATION_PLAN.md.
-- Any agent may mark a task as `- [B]` (blocked) with a reason.
-- Any agent may add new items to IMPLEMENTATION_PLAN.md.
-- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
-- If stuck in a fix/verify loop for more than 6 rounds, mark the task `- [B]` and move on.
-- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
-
-When done, output your final message in this exact format:
-
-TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
-SUMMARY: <1-3 sentence description of what changed and why>\
-"""
-
-PLAN_PROMPT_TEMPLATE = """\
-Plan only — do NOT implement anything.
-
-Read `specs/*` and @IMPLEMENTATION_PLAN.md (if present; it may be stale or wrong).
-
-Search the codebase to verify what is and isn't implemented. Use as many subagents as needed to parallelize work. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
-
-Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
-
-Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
-
-For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist.
-
-For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
-
-When done, output your final message in this exact format:
-
-TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
-SUMMARY: <1-3 sentence description of what changed and why>\
-"""
-
-SPEC_PROMPT_TEMPLATE = """\
-Help me write or update a specification for a software project. If there are already files in ./specs, study them first. Then interview me in detail using the AskUserQuestionTool about anything. Be very in-depth and continue interviewing me until you have all the information needed. Then create or update the specifications in ./specs/.
-
-Rules for writing the specification:
-
-0. Keep the specification as concise and succinct as possible. Avoid bloat.
-1. Do not refer to the current state of the project, instead write or update the specs so they are self-contained and can be read and understood without prior knowledge of the project.
-2. A specification is not a plan, do not include specific impmlementation steps.
-3. Use OpenAPI 3.0 to design APIs.
-4. Use mermaid entity relation diagram to document databases and other data models.
-5. Use mermaid flowcharts or message sequence diagrams to document data flows and system interaction.
-6. Every feature must be documented with acceptance criteria and an e2e test plan.
-7. Include a requirement for concise and succinct documentation and a getting started guide in README.md.
-8. Include a requirement for linting the code base.
-
-Once you've written the specification, study it again and point out any inconsistencies, gaps or blindspots. If there are any lets resolve them together.\
-"""
-
-# ─── Pi prompt templates ───────────────────────────────────────────────────────
-# Variants for the `pi` agent, which has no subagent/Task tool. QA and review are
-# done inline in the same context; parallel-subagent instructions are removed.
-
-BUILD_PROMPT_PI_TEMPLATE = """\
-Read `specs/*` and @IMPLEMENTATION_PLAN.md. Pick the highest-priority unchecked item and implement it.
+Read `specs/*` and @IMPLEMENTATION_PLAN.md. Work on the **topmost unchecked (`- [ ]`) task** in the plan — that is the task the orchestrator has selected for this iteration.
 
 ## Implementation
 
@@ -138,28 +49,39 @@ Implement the item fully — no placeholders or stubs. Fix any failures includin
 
 Use TDD — write tests first, then implement to make them pass. Keep code DRY and lean.
 
-Build, test, and lint. All must pass before proceeding.
+Build, test, and lint locally. All must pass before reporting completion. A separate QA pass will run after you finish; do not try to QA your own work here.
 
-## QA
+## Rules
 
-When implementation is complete, do a QA pass on your own work. The task being verified is the plan item you just implemented.
+- Do **not** edit any marker in `IMPLEMENTATION_PLAN.md`. The QA pass flips `- [ ]` → `- [x]` on success; the orchestrator flips to `- [B]` on terminal failure.
+- If you discover out-of-scope work (a real prerequisite, a missing dependency, follow-up scope), append a new `- [ ]` line for it **below the in-flight task** (or at the end of the plan). Never insert above the in-flight task — that would change which task is current.
+- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief.
 
-1. Re-read the relevant specs in `specs/*` to understand the expected behavior and acceptance criteria.
-2. Check the E2E test files and verify there is at least one E2E test for each acceptance criterion (AC) mentioned in the spec for this feature. If any AC lacks an E2E test, add it — do not consider QA complete until every AC has E2E coverage.
-3. Run the build, tests, and linter to confirm they pass.
-4. Start the app and smoke test the new feature(s) end to end — make real requests, verify responses, check that the feature works as a user would experience it. Don't rely solely on automated tests.
-5. If there are gaps in test coverage or smoke test failures, fix them and repeat the QA pass.
+When done, output your final message in this exact format, on two separate lines:
 
-Repeat the QA pass until everything is covered, passing, and works end to end.
+TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
+SUMMARY: <1-3 sentence description of what changed and why>\
+"""
 
-## Completion rules
+PLAN_PROMPT_TEMPLATE = """\
+Plan only — do NOT implement anything.
 
-- Mark a task `- [x]` in IMPLEMENTATION_PLAN.md only after the QA pass above succeeds.
-- Mark a task `- [B]` (blocked) with a reason if it cannot be completed.
-- Add new items to IMPLEMENTATION_PLAN.md as needed.
-- If a task is blocked and needs human intervention (e.g. missing credentials, ambiguous spec), mark it `- [B]` with a brief reason and move on to the next unchecked item.
-- If stuck in a fix/verify loop for more than 6 rounds, mark the task `- [B]` and move on.
-- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands). Keep it brief — progress belongs in IMPLEMENTATION_PLAN.md.
+Read the following inputs, in this order:
+1. `specs/*` — the source of truth for what should exist.
+2. `@IMPLEMENTATION_PLAN.md` (if present; it may be stale or wrong).
+3. Any `- [B]` lines in the existing plan with their attached reasons — these flag work that needs human attention.
+
+Search the codebase to verify what is and isn't implemented. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
+
+Produce/update `@IMPLEMENTATION_PLAN.md` as a prioritized checkbox list (`- [ ]` pending, `- [x]` done, `- [B] — <reason>` blocked).
+
+Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
+
+For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist. Tests must never be skipped.
+
+For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
+
+**Sort `- [B]` blocked tasks toward the top of the list where possible.** Build mode stops when the next available task is blocked, so frontloading blockers gets them resolved before iteration starts. If a `- [B]` is genuinely non-blocking for everything below it, leave it where it is so build can keep going.
 
 When done, output your final message in this exact format:
 
@@ -167,25 +89,97 @@ TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
 SUMMARY: <1-3 sentence description of what changed and why>\
 """
 
-PLAN_PROMPT_PI_TEMPLATE = """\
-Plan only — do NOT implement anything.
+QA_PROMPT_TEMPLATE = """\
+You are the QA verifier. The task being verified is:
 
-Read `specs/*` and @IMPLEMENTATION_PLAN.md (if present; it may be stale or wrong).
+    {TASK}
 
-Search the codebase to verify what is and isn't implemented. Never assume something is missing — confirm with code search. Look for TODOs, placeholders, stubs, skipped/flaky tests, and incomplete implementations.
+Your job is to verify that the implementation in the current worktree adequately covers the spec for this task.
 
-Produce/update @IMPLEMENTATION_PLAN.md as a prioritized checkbox list (`- [ ]` pending, `- [x]` done).
+Do **not** read the implementation source code. Only read:
+- the relevant files in `specs/*`
+- the test files
+- `@CLAUDE.md` for operational commands (build, test, lint, run)
+- `@IMPLEMENTATION_PLAN.md` to locate the task
 
-Check that all dependencies required by the spec are available: command line tools, MCP servers, API keys, environment variables, etc. If anything is missing, create a task for it and mark it as `- [B]` (blocked) with what's needed.
+Then:
 
-For each acceptance criterion (AC) in the specs, ensure there is a task to add an E2E test if one doesn't already exist.
+1. For each acceptance criterion (AC) named in the spec for this feature, confirm there is at least one E2E test covering it. If any AC lacks an E2E test, that is a QA failure.
+2. Run the project's build, tests, and linter. Any failure is a QA failure.
+3. Start the app and smoke-test the new feature end to end (real requests, real responses). Failure to start, or visibly incorrect behavior, is a QA failure.
 
-For each task, consider whether it can be fully executed by an LLM without human involvement. If a task requires human input (e.g. API keys, credentials, third-party account setup, ambiguous requirements that need a product decision, manual deployment steps), mark it as `- [B]` (blocked) with a brief reason. The goal is to surface blockers early so they can be resolved before build iterations start.
+Plan-file rule:
 
-When done, output your final message in this exact format:
+- **On PASS**: flip the in-flight `- [ ]` line for the verified task to `- [x]` in `IMPLEMENTATION_PLAN.md`. That is the only edit you make to the plan.
+- **On FAIL**: do not edit the plan at all.
 
-TITLE: <short headline, max 50 chars, e.g. "Add user authentication endpoint">
-SUMMARY: <1-3 sentence description of what changed and why>\
+If you spot out-of-scope work (something this task didn't claim to do but should exist), append a new `- [ ]` line for it below the in-flight task in `IMPLEMENTATION_PLAN.md`.
+
+When done, your final message must be **exactly one** of the two forms below, on its own lines, with no other text after:
+
+QA: PASS
+
+— or —
+
+QA: FAIL
+ISSUES:
+- <one-line issue>
+- <one-line issue>
+DETAILS:
+<freeform multi-paragraph explanation>\
+"""
+
+FIX_PROMPT_TEMPLATE = """\
+You are continuing a task another agent started. The code currently in the worktree is their work; a separate QA pass has reported the issues below. Address them.
+
+## The task
+
+    {TASK}
+
+## QA report (verbatim)
+
+{QA_REPORT}
+
+## Diff stat of the prior attempt
+
+{LAST_DIFF}
+
+## What to do
+
+Read the relevant specs in `specs/*` and the failing tests. Address each issue in the QA report. Do not start from scratch — extend or fix what is already in the worktree.
+
+Build, test, and lint locally. All must pass before reporting completion. A QA pass will re-run after you finish.
+
+## Rules
+
+- Do **not** edit any marker in `IMPLEMENTATION_PLAN.md`.
+- If you discover out-of-scope work, append a new `- [ ]` line for it below the in-flight task (or at end of the plan).
+- Update @CLAUDE.md only with operational knowledge (e.g. correct build commands).
+
+When done, output your final message in this exact format, on two separate lines:
+
+TITLE: <short headline, max 50 chars>
+SUMMARY: <1-3 sentence description of what you fixed and how>\
+"""
+
+SPEC_PROMPT_TEMPLATE = """\
+Help me write or update a specification for a software project. If there are already files in ./specs, study them first. Then interview me in detail, asking one focused question at a time about anything that needs clarification. Be very in-depth and continue interviewing me until you have all the information needed. Then create or update the specifications in ./specs/.
+
+Rules for writing the specification:
+
+0. Keep the specification as concise and succinct as possible. Avoid bloat.
+1. Do not refer to the current state of the project, instead write or update the specs so they are self-contained and can be read and understood without prior knowledge of the project.
+2. A specification is not a plan, do not include specific impmlementation steps.
+3. Use OpenAPI 3.0 to design APIs.
+4. Use single page html for visual content, otherwise use markdown
+5. Use mermaid entity relation diagram to document databases and other data models.
+6. Use mermaid flowcharts or message sequence diagrams to document data flows and system interaction.
+7. Every feature must be documented with acceptance criteria.
+8. Include a requirement for concise and succinct documentation and a getting started guide in README.md.
+9. Include a requirement for linting the code base.
+10. Include a requirement for e2e testing.
+
+Once you've written the specification, study it again and point out any inconsistencies, gaps or blindspots. If there are any lets resolve them together.\
 """
 
 # ─── Terminal helpers ─────────────────────────────────────────────────────────
@@ -199,14 +193,7 @@ BLUE = "\033[34m"
 CYAN = "\033[36m"
 RESET = "\033[0m"
 
-
-def _supports_color() -> bool:
-    if os.environ.get("NO_COLOR"):
-        return False
-    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
-
-
-COLOR = _supports_color()
+COLOR = bool(sys.stdout.isatty()) and not os.environ.get("NO_COLOR")
 
 
 def c(code: str, text: str) -> str:
@@ -220,6 +207,12 @@ def banner(text: str) -> None:
     print(c(CYAN, f"  {text}"))
     print(c(CYAN, "=" * width))
     print()
+
+
+def section(title: str) -> None:
+    print()
+    print(f"  {c(BOLD, title)}")
+    print(f"  {c(DIM, '-' * len(title))}")
 
 
 def info(msg: str) -> None:
@@ -238,267 +231,236 @@ def error(msg: str) -> None:
     print(f"  {c(RED, 'x')} {msg}")
 
 
-def section(title: str) -> None:
-    print()
-    print(f"  {c(BOLD, title)}")
-    print(f"  {c(DIM, '-' * len(title))}")
+# ─── Git helpers ──────────────────────────────────────────────────────────────
 
 
-# ─── Precondition checks ─────────────────────────────────────────────────────
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True)
 
 
-def check_git_repo() -> bool:
-    """Verify we are inside a git repository."""
-    result = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        capture_output=True, text=True,
-    )
-    return result.returncode == 0
+def git_head() -> str:
+    r = _git("rev-parse", "--short", "HEAD")
+    return r.stdout.strip() if r.returncode == 0 else "unknown"
 
 
-def check_clean_worktree() -> bool:
-    """Return True if there are no uncommitted or unstaged changes."""
-    # Check for staged changes
-    staged = subprocess.run(
-        ["git", "diff", "--cached", "--quiet"],
-        capture_output=True,
-    )
-    # Check for unstaged changes
-    unstaged = subprocess.run(
-        ["git", "diff", "--quiet"],
-        capture_output=True,
-    )
-    # Check for untracked files
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        capture_output=True, text=True,
-    )
-
-    clean = staged.returncode == 0 and unstaged.returncode == 0 and not untracked.stdout.strip()
-
-    if not clean:
-        if staged.returncode != 0:
-            warn("There are staged (uncommitted) changes")
-        if unstaged.returncode != 0:
-            warn("There are unstaged modifications")
-        if untracked.stdout.strip():
-            warn("There are untracked files:")
-            for f in untracked.stdout.strip().splitlines()[:10]:
-                print(f"      {c(DIM, f)}")
-
-    return clean
+def git_branch() -> str:
+    r = _git("branch", "--show-current")
+    return r.stdout.strip() if r.returncode == 0 else "unknown"
 
 
-def check_prompt_file(prompt_file: str) -> bool:
-    """Verify the prompt file exists."""
-    if not Path(prompt_file).exists():
-        error(f"Prompt file not found: {prompt_file}")
-        info("Expected file in the current directory.")
-        return False
-    return True
+def is_git_repo() -> bool:
+    return _git("rev-parse", "--is-inside-work-tree").returncode == 0
 
 
-def check_agent_installed(agent: str) -> bool:
-    """Verify the selected agent CLI is on PATH."""
-    if shutil.which(agent) is None:
-        error(f"{agent} CLI not found. Is it installed and on PATH?")
-        return False
-    return True
+def has_uncommitted_changes() -> bool:
+    """True if there's anything to commit (ignored files don't count)."""
+    r = _git("status", "--porcelain")
+    return bool(r.stdout.strip())
+
+
+def ensure_gitignore() -> None:
+    """Ensure `.ralph/` is in .gitignore."""
+    gi = Path(".gitignore")
+    entry = ".ralph/"
+    if gi.exists():
+        lines = [l.rstrip() for l in gi.read_text().splitlines()]
+        if entry in lines:
+            return
+        text = gi.read_text()
+        if not text.endswith("\n"):
+            text += "\n"
+        gi.write_text(text + entry + "\n")
+    else:
+        gi.write_text(entry + "\n")
 
 
 # ─── Plan parsing ─────────────────────────────────────────────────────────────
 
 
+_PLAN_LINE_RE = re.compile(r'^[-*]\s+\[([ xXbB])\]\s+(.*?)\s*$')
+
+
 def parse_plan_tasks(path: str = IMPLEMENTATION_PLAN) -> dict:
-    """Parse IMPLEMENTATION_PLAN.md and return task statistics.
-
-    Returns dict with keys: total, done, pending, blocked, tasks (list of dicts).
-    Tasks are identified by markdown checkbox syntax: - [ ], - [x], or - [B].
-    """
+    """Return task statistics: total, done, pending, blocked, tasks (list)."""
     result = {"total": 0, "done": 0, "pending": 0, "blocked": 0, "tasks": []}
-
-    plan_path = Path(path)
-    if not plan_path.exists():
+    p = Path(path)
+    if not p.exists():
         return result
-
-    text = plan_path.read_text()
-    for line in text.splitlines():
-        stripped = line.strip()
-        # Match markdown checkboxes:  - [ ] / - [x] / - [B]  or  * [x] etc.
-        m = re.match(r'^[-*]\s+\[([ xXbB])\]\s+(.*)', stripped)
-        if m:
-            marker = m.group(1)
-            task_text = m.group(2).strip()
-            result["total"] += 1
-            if marker.lower() == 'x':
-                result["done"] += 1
-                result["tasks"].append({"text": task_text, "status": "done"})
-            elif marker.lower() == 'b':
-                result["blocked"] += 1
-                result["tasks"].append({"text": task_text, "status": "blocked"})
-            else:
-                result["pending"] += 1
-                result["tasks"].append({"text": task_text, "status": "pending"})
-
+    for line in p.read_text().splitlines():
+        m = _PLAN_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        marker = m.group(1).lower()
+        text = m.group(2).strip()
+        result["total"] += 1
+        if marker == 'x':
+            result["done"] += 1
+            status = "done"
+        elif marker == 'b':
+            result["blocked"] += 1
+            status = "blocked"
+        else:
+            result["pending"] += 1
+            status = "pending"
+        result["tasks"].append({"text": text, "status": status})
     return result
 
 
+def next_pending_or_blocker(path: str = IMPLEMENTATION_PLAN) -> tuple[str, str]:
+    """Walk the plan top to bottom, return the first non-`[x]` task.
+
+    Returns ('pending', text) for a `- [ ]` row, ('blocker', text) for a `- [B]`
+    row, or ('done', '') when nothing remains. The `text` for a blocker
+    includes any ` — reason` suffix as written in the file.
+    """
+    p = Path(path)
+    if not p.exists():
+        return ('done', '')
+    for line in p.read_text().splitlines():
+        m = _PLAN_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        marker = m.group(1).lower()
+        if marker == 'x':
+            continue
+        text = m.group(2).strip()
+        if marker == ' ':
+            return ('pending', text)
+        if marker == 'b':
+            return ('blocker', text)
+    return ('done', '')
+
+
+def _flip_pending_marker(task_text: str, new_marker: str, suffix: str = "") -> bool:
+    """Flip the `- [ ]` line whose body is `task_text` to `- [<new_marker>] …`.
+
+    Orchestrator-only writer for plan markers. Used for:
+      - PASS fallback (`new_marker='x'`) if the QA agent forgot to flip.
+      - Terminal QA fail (`new_marker='B'` + reason suffix).
+    Byte-exact match is always expected — the caller just read the text from
+    the plan. Returns False (with a stderr warning) if no match is found.
+    """
+    plan = Path(IMPLEMENTATION_PLAN)
+    if not plan.exists():
+        print(f"  ! flip_marker: {IMPLEMENTATION_PLAN} not found", file=sys.stderr)
+        return False
+    pattern = re.compile(
+        r'^([-*])(\s+)\[ \](\s+)' + re.escape(task_text) + r'(\s*)$',
+        re.MULTILINE,
+    )
+    new_text, n = pattern.subn(
+        lambda m: f"{m.group(1)}{m.group(2)}[{new_marker}]{m.group(3)}{task_text}{suffix}",
+        plan.read_text(),
+        count=1,
+    )
+    if n == 0:
+        print(f"  ! flip_marker: could not find: {task_text[:80]!r}", file=sys.stderr)
+        return False
+    plan.write_text(new_text)
+    return True
+
+
+def mark_task_done(task_text: str) -> bool:
+    return _flip_pending_marker(task_text, "x")
+
+
+def mark_task_blocked(task_text: str, reason: str) -> bool:
+    suffix = f" — {reason}"
+    if len(suffix) > 200:
+        suffix = suffix[:197] + "..."
+    return _flip_pending_marker(task_text, "B", suffix)
+
+
 def print_plan_summary(tasks: dict) -> None:
-    """Print a human-readable summary of the implementation plan."""
     if tasks["total"] == 0:
         info("No tasks found in IMPLEMENTATION_PLAN.md")
         return
-
-    pct = (tasks["done"] / tasks["total"]) * 100 if tasks["total"] > 0 else 0
-    bar_width = 30
-    filled = int(bar_width * tasks["done"] / tasks["total"])
-    bar = c(GREEN, "#" * filled) + c(DIM, "-" * (bar_width - filled))
-
-    info(f"Progress: [{bar}] {pct:.0f}%")
-    blocked_str = f" / {c(RED, str(tasks['blocked']))} blocked" if tasks["blocked"] else ""
-    info(f"Tasks: {c(GREEN, str(tasks['done']))} done / {c(YELLOW, str(tasks['pending']))} pending{blocked_str} / {tasks['total']} total")
+    pct = (tasks["done"] / tasks["total"]) * 100
+    blocked = f" / {c(RED, str(tasks['blocked']))} blocked" if tasks["blocked"] else ""
+    info(f"Tasks: {c(GREEN, str(tasks['done']))} done / {c(YELLOW, str(tasks['pending']))} pending{blocked} / {tasks['total']} total ({pct:.0f}%)")
 
 
-# ─── Claude interaction ───────────────────────────────────────────────────────
+# ─── Agent invocation ────────────────────────────────────────────────────────
 
 
-def get_git_head() -> str:
-    """Return the current HEAD commit hash (short)."""
-    result = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
+def _parse_claude_log(log_path: Path) -> dict:
+    """Read a claude stream-json log; return result_text + token totals.
 
-
-def get_git_branch() -> str:
-    """Return the current branch name."""
-    result = subprocess.run(
-        ["git", "branch", "--show-current"],
-        capture_output=True, text=True,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
-
-
-
-STREAM_LOG = "stream.jsonl"
-THINKING_LOG = "THINKING.md"
-
-
-def _tool_hint(name: str, inp: dict) -> str:
-    """Extract a short, readable hint from a tool_use input block."""
-    if not isinstance(inp, dict):
-        return ""
-    for key in ("file_path", "path", "pattern", "command", "description", "query", "url", "prompt"):
-        if key in inp:
-            val = str(inp[key]).replace("\n", " ")
-            if len(val) > 120:
-                val = val[:117] + "..."
-            return val
-    return ""
-
-
-def _handle_claude_event(event: dict, result_data: dict, think_f) -> None:
-    """Parse one claude stream-json event into result_data + THINKING.md."""
-    etype = event.get("type", "")
-
-    if etype == "assistant" and "message" in event:
-        for block in event["message"].get("content", []):
-            btype = block.get("type")
-            if btype == "text":
-                text = block.get("text", "")
-                result_data["result_text"] += text
-                if text.strip():
-                    think_f.write(text + "\n\n")
-            elif btype == "thinking":
-                thought = block.get("thinking", "").strip()
-                if thought:
-                    think_f.write(f"> _thinking:_ {thought}\n\n")
-            elif btype == "tool_use":
-                tname = block.get("name", "?")
-                hint = _tool_hint(tname, block.get("input", {}))
-                if hint:
-                    think_f.write(f"**[{tname}]** `{hint}`\n\n")
-                else:
-                    think_f.write(f"**[{tname}]**\n\n")
-        think_f.flush()
-
-    elif etype == "result":
-        result_data["cost_usd"] = event.get("total_cost_usd", 0)
-        result_data["result_text"] = event.get("result", result_data["result_text"])
-        result_data["success"] = True
-
-        model_usage = event.get("modelUsage", {})
-        tokens_in = tokens_out = cache_read = cache_creation = 0
-        for model_stats in model_usage.values():
-            tokens_in += model_stats.get("inputTokens", 0)
-            tokens_out += model_stats.get("outputTokens", 0)
-            cache_read += model_stats.get("cacheReadInputTokens", 0)
-            cache_creation += model_stats.get("cacheCreationInputTokens", 0)
-        result_data["tokens_in"] = tokens_in
-        result_data["tokens_out"] = tokens_out
-        result_data["cache_read"] = cache_read
-        result_data["cache_creation"] = cache_creation
-
-
-def _handle_pi_event(event: dict, result_data: dict, think_f) -> None:
-    """Parse one pi `--mode json` event into result_data + THINKING.md (best-effort).
-
-    Pi's JSON schema is only partially documented: token usage, cost, and the
-    thinking/reasoning delta type are not specified, so those stay at zero.
-    TODO(pi): wire up tokens/cost/thinking once verified against a real pi run.
+    The terminal `result` event carries `.result` (final assistant text) and
+    `.modelUsage` (per-model token counts). Everything else in the stream is
+    just thinking/tool transcripts we don't need to interpret.
     """
-    etype = event.get("type", "")
-
-    if etype == "message_update":
-        ame = event.get("assistantMessageEvent", {})
-        if ame.get("type") == "text_delta":
-            delta = ame.get("delta", "")
-            result_data["result_text"] += delta
-            think_f.write(delta)
-            think_f.flush()
-
-    elif etype == "tool_execution_start":
-        tname = event.get("toolName", "?")
-        hint = _tool_hint(tname, event.get("args", {}))
-        if hint:
-            think_f.write(f"\n**[{tname}]** `{hint}`\n\n")
-        else:
-            think_f.write(f"\n**[{tname}]**\n\n")
-        think_f.flush()
-
-
-def run_agent_iteration(prompt_file: str, model: str = "opus", agent: str = "claude") -> dict:
-    """Run a single agent CLI iteration and parse its streaming JSON output.
-
-    `agent` selects the backend ("claude" or "pi"). Writes two log files
-    (overwritten each iteration):
-      - stream.jsonl: raw streaming JSON events
-      - THINKING.md:  human-readable assistant text + tool calls
-
-    Returns dict with: success, tokens_in, tokens_out, duration_s, error.
-    """
-    prompt_text = Path(prompt_file).read_text()
-
-    start = time.monotonic()
-    result_data = {
-        "success": False,
-        "tokens_in": 0,
-        "tokens_out": 0,
-        "cache_read": 0,
-        "cache_creation": 0,
-        "duration_s": 0,
-        "cost_usd": 0,
-        "result_text": "",
-        "error": None,
+    result_text = ""
+    tokens_in = tokens_out = 0
+    found_result = False
+    if not log_path.exists():
+        return {"result_text": "", "tokens_in": 0, "tokens_out": 0, "found_result": False}
+    with open(log_path) as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                ev = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                found_result = True
+                result_text = ev.get("result", "") or result_text
+                for mu in ev.get("modelUsage", {}).values():
+                    tokens_in += mu.get("inputTokens", 0)
+                    tokens_out += mu.get("outputTokens", 0)
+    return {
+        "result_text": result_text,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "found_result": found_result,
     }
 
+
+def _parse_pi_log(log_path: Path) -> dict:
+    """Aggregate text_delta events from a pi `--mode json` log into a string.
+
+    Pi has no terminal "result" event and its token/cost fields aren't yet
+    documented — see the TODO in CLAUDE.md.
+    """
+    result_text = ""
+    if not log_path.exists():
+        return {"result_text": "", "tokens_in": 0, "tokens_out": 0, "found_result": False}
+    with open(log_path) as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                ev = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "message_update":
+                ame = ev.get("assistantMessageEvent", {})
+                if ame.get("type") == "text_delta":
+                    result_text += ame.get("delta", "")
+    return {"result_text": result_text, "tokens_in": 0, "tokens_out": 0, "found_result": bool(result_text)}
+
+
+def run_agent(
+    prompt_text: str,
+    log_path: Path,
+    model: str,
+    agent: str,
+) -> dict:
+    """Spawn the agent CLI with stdout streamed straight to `log_path`.
+
+    No event loop, no live terminal output: the user can `tail -f` the log file
+    in another terminal if they want to watch. After the process exits, the log
+    is parsed to extract the agent's final assistant text + token totals.
+
+    Returns: {success, tokens_in, tokens_out, duration_s, result_text, error}.
+    """
     if agent == "pi":
-        # pi takes the prompt as an argv argument (piped stdin is treated as file
-        # content), emits events via --mode json, and resolves --model itself.
         cmd = ["pi", "-p", prompt_text, "--mode", "json", "--model", model]
         env = {**os.environ, "PI_SKIP_VERSION_CHECK": "1"}
-        handle_event = _handle_pi_event
+        stdin_input = None
     else:
         cmd = [
             "claude", "-p",
@@ -508,74 +470,117 @@ def run_agent_iteration(prompt_file: str, model: str = "opus", agent: str = "cla
             "--verbose",
         ]
         env = {**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
-        handle_event = _handle_claude_event
+        stdin_input = prompt_text
 
-    raw_f = None
-    think_f = None
+    out = {
+        "success": False, "tokens_in": 0, "tokens_out": 0,
+        "duration_s": 0, "result_text": "", "error": None,
+    }
+
+    start = time.monotonic()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        raw_f = open(STREAM_LOG, "w")
-        think_f = open(THINKING_LOG, "w")
-        think_f.write(f"# {agent} thinking log\n\n_Model: {model} — prompt: {prompt_file}_\n\n---\n\n")
-        think_f.flush()
-
-        proc = subprocess.Popen(
-            cmd,
-            # claude reads the prompt from stdin; pi gets it as an argv arg.
-            stdin=subprocess.PIPE if agent == "claude" else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-
-        if agent == "claude":
-            # Prompt is small — write and close stdin before reading stdout.
-            proc.stdin.write(prompt_text)
-            proc.stdin.close()
-
-        for line in proc.stdout:
-            raw_f.write(line)
-            raw_f.flush()
-
-            line_s = line.strip()
-            if not line_s:
-                continue
-            try:
-                event = json.loads(line_s)
-            except json.JSONDecodeError:
-                continue
-
-            handle_event(event, result_data, think_f)
-
-        proc.wait()
-        stderr = proc.stderr.read()
-        result_data["duration_s"] = time.monotonic() - start
-
-        # Pi has no terminal "result" event to flip success — use the exit code.
-        if agent == "pi" and proc.returncode == 0:
-            result_data["success"] = True
-
-        if proc.returncode != 0 and not result_data["success"]:
-            result_data["error"] = stderr.strip() or f"{agent} exited with code {proc.returncode}"
-
+        with open(log_path, "w") as logf:
+            proc = subprocess.run(
+                cmd,
+                input=stdin_input,
+                stdout=logf,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
     except FileNotFoundError:
-        result_data["error"] = f"{agent} CLI not found. Is it installed and on PATH?"
-    except Exception as e:
-        result_data["error"] = str(e)
-    finally:
-        if raw_f is not None:
-            raw_f.close()
-        if think_f is not None:
-            think_f.close()
+        out["duration_s"] = time.monotonic() - start
+        out["error"] = f"{agent} CLI not found. Is it installed and on PATH?"
+        return out
 
-    return result_data
+    out["duration_s"] = time.monotonic() - start
+
+    parsed = (_parse_pi_log if agent == "pi" else _parse_claude_log)(log_path)
+    out["result_text"] = parsed["result_text"]
+    out["tokens_in"] = parsed["tokens_in"]
+    out["tokens_out"] = parsed["tokens_out"]
+
+    # Claude: trust the `result` event. Pi: trust the exit code.
+    if agent == "claude":
+        out["success"] = parsed["found_result"] and proc.returncode == 0
+    else:
+        out["success"] = proc.returncode == 0
+
+    if not out["success"]:
+        stderr = (proc.stderr or "").strip()
+        out["error"] = stderr or f"{agent} exited with code {proc.returncode}"
+
+    return out
 
 
-# ─── Token formatting ────────────────────────────────────────────────────────
+# ─── Prompt rendering / output parsing ───────────────────────────────────────
+
+
+def render_prompt(template_path: str, **vars: str) -> str:
+    """Literal `{KEY}` substitution. Placeholder values may contain braces."""
+    text = Path(template_path).read_text()
+    for key, value in vars.items():
+        text = text.replace("{" + key + "}", value)
+    return text
+
+
+def parse_title_summary(text: str) -> tuple[str, str]:
+    """Pull TITLE: and SUMMARY: lines. Defaults to ('', '') if missing."""
+    title = ""
+    summary = ""
+    for line in text.strip().splitlines():
+        s = line.strip()
+        u = s.upper()
+        if u.startswith("TITLE:"):
+            title = s[6:].strip()
+        elif u.startswith("SUMMARY:"):
+            summary = s[8:].strip()
+    return title, summary
+
+
+def parse_qa_result(text: str) -> tuple[str, str]:
+    """Return (verdict, report) where verdict is 'PASS', 'FAIL', or 'UNKNOWN'.
+
+    `report` is everything from the first `QA:` line to the end of the message;
+    it's what we hand to the fix agent verbatim.
+    """
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if s.upper().startswith("QA:"):
+            tail = s[3:].strip().upper().split()
+            verdict = tail[0] if tail else ""
+            if verdict not in ("PASS", "FAIL"):
+                verdict = "UNKNOWN"
+            return verdict, "\n".join(lines[idx:]).strip()
+    return "UNKNOWN", text.strip()
+
+
+def extract_first_issue(qa_report: str) -> str:
+    """The first `- ...` bullet under ISSUES:, used as the `[B]` reason."""
+    in_issues = False
+    for line in qa_report.splitlines():
+        s = line.strip()
+        if not in_issues and s.upper().startswith("ISSUES:"):
+            in_issues = True
+            continue
+        if in_issues:
+            if s.startswith("- "):
+                return s[2:].strip()
+            if s.upper().startswith(("DETAILS:", "QA:")):
+                break
+    for line in qa_report.splitlines():
+        s = line.strip()
+        if s and not s.upper().startswith("QA:"):
+            return s[:160]
+    return "QA failed"
+
+
+# ─── Formatting helpers ──────────────────────────────────────────────────────
 
 
 def fmt_tokens(n: int) -> str:
-    """Format token count in a human-readable way."""
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
@@ -584,250 +589,231 @@ def fmt_tokens(n: int) -> str:
 
 
 def fmt_duration(seconds: float) -> str:
-    """Format seconds into human-readable duration."""
     if seconds < 60:
         return f"{seconds:.0f}s"
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    if minutes < 60:
-        return f"{minutes}m {secs}s"
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours}h {mins}m"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
 
 
-def fmt_cost(usd: float) -> str:
-    """Format USD cost."""
-    if usd < 0.01:
-        return f"${usd:.4f}"
-    return f"${usd:.2f}"
+# ─── QA cycle ─────────────────────────────────────────────────────────────────
 
 
-def print_running_totals(iteration: int, totals: dict) -> None:
-    """Print running totals across all iterations."""
-    print()
-    info(f"Running totals ({iteration} iteration{'s' if iteration != 1 else ''}):")
-    print(f"      Input:  {c(CYAN, fmt_tokens(totals['tokens_in']))} tokens")
-    print(f"      Output: {c(CYAN, fmt_tokens(totals['tokens_out']))} tokens")
-    print(f"      Cost:   {c(DIM, fmt_cost(totals['cost_usd']))}")
-    print(f"      Time:   {fmt_duration(totals['duration_s'])}")
-    print()
+def _git_diff_stat() -> str:
+    r = _git("diff", "--stat", "HEAD")
+    text = (r.stdout or "").strip()
+    if not text:
+        return "(no changes vs HEAD)"
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (truncated)"
+    return text
 
 
-# ─── Prompt generation ─────────────────────────────────────────────────────────
+def _sum_metrics(dest: dict, src: dict) -> None:
+    for k in ("tokens_in", "tokens_out", "duration_s"):
+        dest[k] = dest.get(k, 0) + src.get(k, 0)
 
 
-def init_project() -> int:
-    """Generate prompt files for loop usage."""
-    files = {
-        BUILD_PROMPT: BUILD_PROMPT_TEMPLATE,
-        PLAN_PROMPT: PLAN_PROMPT_TEMPLATE,
-        SPEC_PROMPT: SPEC_PROMPT_TEMPLATE,
-        BUILD_PROMPT_PI: BUILD_PROMPT_PI_TEMPLATE,
-        PLAN_PROMPT_PI: PLAN_PROMPT_PI_TEMPLATE,
+def run_qa_cycle(
+    task: str,
+    model: str,
+    agent: str,
+    max_attempts: int,
+    iter_log_dir: Path,
+) -> dict:
+    """One task end-to-end: impl → QA → (fix → QA){0..N-1}.
+
+    `task` is the topmost `- [ ]` text the orchestrator picked. Returns:
+      outcome: 'pass' | 'blocked' | 'agent_error'
+      attempts: total impl+fix invocations (does not count QA calls)
+      title, summary: from the latest impl-or-fix call
+      last_qa_report, first_issue
+      totals: aggregated tokens/duration across all calls
+      error: brief message on agent_error
+    """
+    totals = {"tokens_in": 0, "tokens_out": 0, "duration_s": 0}
+    result = {
+        "outcome": "agent_error", "attempts": 0,
+        "title": "", "summary": "",
+        "last_qa_report": "", "first_issue": "",
+        "totals": totals, "error": None,
     }
 
-    for filename, content in files.items():
-        path = Path(filename)
-        if path.exists():
-            warn(f"{filename} already exists, overwriting")
-        path.write_text(content)
-        success(f"Generated {filename}")
-
-    print()
-    info("Next steps:")
-    info(f"  1. Review and customise the generated prompts")
-    info(f"  2. Create specs/ directory with your application specifications")
-    info(f"  3. Run: python loop.py plan")
-    print()
-
-    return 0
-
-
-def has_uncommitted_changes() -> bool:
-    """Return True if there are any staged, unstaged, or untracked changes."""
-    staged = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True)
-    unstaged = subprocess.run(["git", "diff", "--quiet"], capture_output=True)
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
-        capture_output=True, text=True,
+    info(f"Running {agent} (impl)…")
+    impl = run_agent(
+        Path(BUILD_PROMPT).read_text(),
+        iter_log_dir / "impl.jsonl",
+        model, agent,
     )
-    return staged.returncode != 0 or unstaged.returncode != 0 or bool(untracked.stdout.strip())
+    _sum_metrics(totals, impl)
+    if not impl["success"]:
+        result["error"] = impl.get("error") or "impl call failed"
+        return result
+    result["attempts"] = 1
+    result["title"], result["summary"] = parse_title_summary(impl.get("result_text", ""))
+
+    for attempt in range(1, max_attempts + 1):
+        info(f"Running {agent} (qa, attempt {attempt}/{max_attempts})…")
+        qa = run_agent(
+            render_prompt(QA_PROMPT, TASK=task),
+            iter_log_dir / f"qa.{attempt}.jsonl",
+            model, agent,
+        )
+        _sum_metrics(totals, qa)
+        if not qa["success"]:
+            result["error"] = qa.get("error") or "qa call failed"
+            return result
+
+        verdict, qa_report = parse_qa_result(qa.get("result_text", ""))
+        result["last_qa_report"] = qa_report
+        result["first_issue"] = extract_first_issue(qa_report)
+
+        if verdict == "PASS":
+            result["outcome"] = "pass"
+            return result
+
+        if attempt >= max_attempts:
+            break
+
+        info(f"QA: {verdict}. Running {agent} (fix, attempt {attempt}/{max_attempts - 1})…")
+        fix = run_agent(
+            render_prompt(
+                FIX_PROMPT,
+                TASK=task,
+                QA_REPORT=qa_report,
+                LAST_DIFF=_git_diff_stat(),
+            ),
+            iter_log_dir / f"fix.{attempt}.jsonl",
+            model, agent,
+        )
+        _sum_metrics(totals, fix)
+        result["attempts"] += 1
+        if not fix["success"]:
+            result["error"] = fix.get("error") or "fix call failed"
+            return result
+        new_title, new_summary = parse_title_summary(fix.get("result_text", ""))
+        if new_title:
+            result["title"] = new_title
+        if new_summary:
+            result["summary"] = new_summary
+
+    result["outcome"] = "blocked"
+    return result
 
 
-# Per-iteration log files the loop writes itself — changes to these don't count as progress.
-LOOP_ARTIFACT_FILES = {STREAM_LOG, THINKING_LOG}
-
-
-def has_substantive_changes() -> bool:
-    """Return True if anything changed besides the loop's own per-iteration log files."""
-    result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-    if result.returncode != 0:
-        return True  # be conservative — treat as progress rather than stopping early
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-        path = line[3:].strip().strip('"')
-        # Renames show "old -> new"; those obviously aren't artifact files.
-        if path not in LOOP_ARTIFACT_FILES:
-            return True
-    return False
-
-
-def parse_title_summary(text: str) -> tuple[str, str]:
-    """Parse TITLE: and SUMMARY: from LLM output. Falls back gracefully."""
-    title = ""
-    summary = ""
-    for line in text.strip().splitlines():
-        if line.strip().upper().startswith("TITLE:"):
-            title = line.strip()[6:].strip()
-        elif line.strip().upper().startswith("SUMMARY:"):
-            summary = line.strip()[8:].strip()
-    # Fallback: use first line as title, rest as summary
-    if not title:
-        lines = text.strip().splitlines()
-        title = lines[0].strip() if lines else "No summary"
-        summary = " ".join(l.strip() for l in lines[1:]).strip() if len(lines) > 1 else ""
-    return title, summary
+# ─── Commit messages ─────────────────────────────────────────────────────────
 
 
 def build_commit_message(
     mode: str,
     iteration: int,
     max_iterations: int,
-    result_text: str,
-    iter_result: dict,
+    title: str,
+    summary: str,
+    iter_metrics: dict,
     model: str,
-    agent: str = "claude",
-    stop_reason: str = "",
+    agent: str,
+    qa_attempts: int = 0,
+    qa_outcome: str = "",
 ) -> str:
-    """Build a structured commit message with metrics."""
     label = mode.capitalize()
-
-    title, summary = parse_title_summary(result_text)
-
-    # Truncate title to keep commit subject readable
+    title = title or "(no title)"
     if len(title) > 50:
         title = title[:47] + "..."
-
     subject = f"{label} ({iteration}/{max_iterations}) - {title}"
-
     parts = [subject, ""]
 
-    if stop_reason:
-        parts.append(stop_reason)
-        parts.append("")
-
-    # Summary
     if summary:
-        parts.append("## Summary")
-        parts.append("")
-        parts.append(summary)
-        parts.append("")
+        parts += ["## Summary", "", summary, ""]
 
-    # Metrics
+    if qa_attempts > 0 and qa_outcome:
+        fix_attempts = max(0, qa_attempts - 1)
+        parts += [
+            f"## QA: {qa_outcome} ({qa_attempts} attempt{'s' if qa_attempts != 1 else ''}, 1 impl + {fix_attempts} fix)",
+            "",
+        ]
+
+    parts += ["## Metrics", ""]
     plan_tasks = parse_plan_tasks()
-    parts.append("## Metrics")
-    parts.append("")
-
     if plan_tasks["total"] > 0:
         pct = (plan_tasks["done"] / plan_tasks["total"]) * 100
-        bar_width = 20
-        filled = int(bar_width * plan_tasks["done"] / plan_tasks["total"])
-        bar = "#" * filled + "-" * (bar_width - filled)
-        blocked_str = f" / {plan_tasks['blocked']} blocked" if plan_tasks["blocked"] else ""
-        parts.append(f"Progress: [{bar}] {pct:.0f}%")
-        parts.append(f"Tasks:    {plan_tasks['done']} done / {plan_tasks['pending']} pending{blocked_str} / {plan_tasks['total']} total")
-
-    parts.append(f"Duration: {fmt_duration(iter_result['duration_s'])}")
+        blocked = f", {plan_tasks['blocked']} blocked" if plan_tasks["blocked"] else ""
+        parts.append(f"Tasks:    {plan_tasks['done']}/{plan_tasks['total']} done ({pct:.0f}%), {plan_tasks['pending']} pending{blocked}")
+    parts.append(f"Duration: {fmt_duration(iter_metrics['duration_s'])}")
     parts.append(f"Agent:    {agent}")
     parts.append(f"Model:    {model}")
-    if iter_result.get("cost_usd"):
-        parts.append(f"Cost:     {fmt_cost(iter_result['cost_usd'])}")
-    parts.append(f"Tokens:   {fmt_tokens(iter_result['tokens_in'])} in / {fmt_tokens(iter_result['tokens_out'])} out / {fmt_tokens(iter_result.get('cache_read', 0))} cache")
-
-    # Blocked tasks
-    if plan_tasks["blocked"] > 0:
-        parts.append("")
-        parts.append("## Blocked")
-        parts.append("")
-        for task in plan_tasks["tasks"]:
-            if task["status"] == "blocked":
-                parts.append(f"- [B] {task['text']}")
-
+    parts.append(f"Tokens:   {fmt_tokens(iter_metrics['tokens_in'])} in / {fmt_tokens(iter_metrics['tokens_out'])} out")
     return "\n".join(parts)
 
 
+# ─── init mode ───────────────────────────────────────────────────────────────
 
-# ─── Main loop ────────────────────────────────────────────────────────────────
+
+def init_project() -> int:
+    files = {
+        BUILD_PROMPT: BUILD_PROMPT_TEMPLATE,
+        PLAN_PROMPT: PLAN_PROMPT_TEMPLATE,
+        QA_PROMPT: QA_PROMPT_TEMPLATE,
+        FIX_PROMPT: FIX_PROMPT_TEMPLATE,
+        SPEC_PROMPT: SPEC_PROMPT_TEMPLATE,
+    }
+    for filename, content in files.items():
+        path = Path(filename)
+        if path.exists():
+            warn(f"{filename} already exists, overwriting")
+        path.write_text(content)
+        success(f"Generated {filename}")
+    ensure_gitignore()
+    success("Ensured `.ralph/` is in .gitignore")
+    print()
+    info("Next steps:")
+    info("  1. Review and customise the generated prompts")
+    info("  2. Create specs/ directory with your application specifications")
+    info("  3. Run: python loop.py plan")
+    print()
+    return 0
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="loop.py",
-        description="Ralph Wiggum Loop — drive Claude Code iteratively.",
+        description="Ralph Wiggum Loop — drive a coding agent iteratively.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
-              %(prog)s init               Generate prompts and update .gitignore
+              %(prog)s init               Generate prompt files + .gitignore
               %(prog)s build              Build mode, 20 iterations (default)
               %(prog)s build -n 10        Build mode, max 10 iterations
-              %(prog)s build --no-stop    Build mode, don't stop when plan is complete
               %(prog)s build --model opus    Build mode with opus model
               %(prog)s plan               Plan mode, 10 iterations (default)
               %(prog)s plan -n 5          Plan mode, 5 iterations
         """),
     )
+    sub = parser.add_subparsers(dest="mode", help="Operating mode")
 
-    subparsers = parser.add_subparsers(dest="mode", help="Operating mode")
+    bp = sub.add_parser("build", help="Implement from IMPLEMENTATION_PLAN.md")
+    bp.add_argument("-n", "--max-iterations", type=int, default=BUILD_DEFAULT_ITERATIONS)
+    bp.add_argument("--model", default="sonnet")
+    bp.add_argument("--agent", choices=["claude", "pi"], default="claude")
+    bp.add_argument("--qa-max-attempts", type=int, default=QA_DEFAULT_MAX_ATTEMPTS,
+                    help=f"Max impl+fix attempts per task before marking `- [B]` (default: {QA_DEFAULT_MAX_ATTEMPTS}, min 1)")
 
-    # Build mode
-    build_parser = subparsers.add_parser("build", help="Implement from IMPLEMENTATION_PLAN.md")
-    build_parser.add_argument(
-        "-n", "--max-iterations", type=int, default=BUILD_DEFAULT_ITERATIONS,
-        help=f"Max iterations (default: {BUILD_DEFAULT_ITERATIONS})",
-    )
-    build_parser.add_argument(
-        "--no-stop", action="store_true",
-        help="Don't stop when all plan tasks are complete",
-    )
-    build_parser.add_argument(
-        "--model", default="sonnet",
-        help="Model to use (default: sonnet)",
-    )
-    build_parser.add_argument(
-        "--agent", choices=["claude", "pi"], default="claude",
-        help="Coding agent backend to drive (default: claude)",
-    )
+    pp = sub.add_parser("plan", help="Generate/update IMPLEMENTATION_PLAN.md")
+    pp.add_argument("-n", "--max-iterations", type=int, default=PLAN_DEFAULT_ITERATIONS)
+    pp.add_argument("--model", default="opus")
+    pp.add_argument("--agent", choices=["claude", "pi"], default="claude")
 
-    # Plan mode
-    plan_parser = subparsers.add_parser("plan", help="Generate/update IMPLEMENTATION_PLAN.md")
-    plan_parser.add_argument(
-        "-n", "--max-iterations", type=int, default=PLAN_DEFAULT_ITERATIONS,
-        help=f"Max iterations (default: {PLAN_DEFAULT_ITERATIONS})",
-    )
-    plan_parser.add_argument(
-        "--model", default="opus",
-        help="Model to use (default: opus)",
-    )
-    plan_parser.add_argument(
-        "--agent", choices=["claude", "pi"], default="claude",
-        help="Coding agent backend to drive (default: claude)",
-    )
-
-    # Init mode
-    subparsers.add_parser(
-        "init",
-        help="Generate prompt files and update .gitignore",
-    )
+    sub.add_parser("init", help="Generate prompt files and update .gitignore")
 
     args = parser.parse_args()
-
     if args.mode is None:
         parser.print_help()
         return 1
-
-    # Handle init early — it doesn't need the loop infrastructure
     if args.mode == "init":
         return init_project()
 
@@ -835,91 +821,82 @@ def main() -> int:
     max_iterations = args.max_iterations
     model = args.model
     agent = args.agent
-    stop_on_complete = mode == "build" and not getattr(args, "no_stop", False)
+    qa_max_attempts = getattr(args, "qa_max_attempts", QA_DEFAULT_MAX_ATTEMPTS)
 
-    if agent == "pi":
-        prompt_file = PLAN_PROMPT_PI if mode == "plan" else BUILD_PROMPT_PI
-    else:
-        prompt_file = PLAN_PROMPT if mode == "plan" else BUILD_PROMPT
+    if mode == "build" and qa_max_attempts < 1:
+        error("--qa-max-attempts must be at least 1.")
+        return 1
 
-    # ── Precondition checks ──────────────────────────────────────────────
+    required_prompts = (
+        [BUILD_PROMPT, QA_PROMPT, FIX_PROMPT] if mode == "build" else [PLAN_PROMPT]
+    )
 
+    # ── Preflight ────────────────────────────────────────────────────────
     banner(f"Ralph Wiggum Loop — {mode.upper()} mode")
-
     section("Preflight Checks")
 
-    # 1. Git repo
-    if not check_git_repo():
+    if not is_git_repo():
         error("Not inside a git repository.")
-        info("Run this from within a git project directory.")
         return 1
     success("Git repository detected")
 
-    # 2. Clean worktree
-    if not check_clean_worktree():
-        print()
-        error("Working tree is not clean.")
-        info("Commit or stash your changes before starting the loop.")
+    if has_uncommitted_changes():
+        error("Working tree is not clean. Commit or stash first.")
         return 1
     success("Working tree is clean")
 
-    # 3. Agent CLI on PATH
-    if not check_agent_installed(agent):
+    if shutil.which(agent) is None:
+        error(f"{agent} CLI not found. Is it installed and on PATH?")
         return 1
     success(f"{agent} CLI found")
 
-    # 4. Prompt file
-    if not check_prompt_file(prompt_file):
-        return 1
-    success(f"Prompt file found: {prompt_file}")
+    for pf in required_prompts:
+        if not Path(pf).exists():
+            error(f"Prompt file not found: {pf}")
+            info("Run `loop.py init` to (re)generate prompt files.")
+            return 1
+        success(f"Prompt file found: {pf}")
 
-    # ── Show initial state ───────────────────────────────────────────────
+    ensure_gitignore()
 
-    branch = get_git_branch()
-    head = get_git_head()
-
+    # ── Configuration block ─────────────────────────────────────────────
     section("Configuration")
     info(f"Mode:       {c(BOLD, mode.upper())}")
     info(f"Agent:      {c(BOLD, agent)}")
     info(f"Model:      {c(BOLD, model)}")
-    info(f"Branch:     {c(CYAN, branch)}")
-    info(f"Head:       {c(DIM, head)}")
-    info(f"Prompt:     {prompt_file}")
+    info(f"Branch:     {c(CYAN, git_branch())}")
+    info(f"Head:       {c(DIM, git_head())}")
+    info(f"Prompts:    {', '.join(required_prompts)}")
     info(f"Max iters:  {max_iterations}")
     if mode == "build":
-        info(f"Stop on completion: {c(GREEN, 'yes') if stop_on_complete else c(DIM, 'no')}")
+        info(f"QA attempts: {qa_max_attempts} (impl + up to {qa_max_attempts - 1} fix)")
 
-    # Show plan status
+    # Preflight blocker check — only relevant in build mode.
+    if mode == "build":
+        kind, task = next_pending_or_blocker()
+        if kind == "done":
+            section("Implementation Plan")
+            warn("No tasks in plan, or all already done.")
+        elif kind == "blocker":
+            section("Implementation Plan")
+            print_plan_summary(parse_plan_tasks())
+            print()
+            error(f"Next task is blocked — resolve before running build:")
+            print(f"      {c(RED, '[B]')} {task}")
+            return 1
+
     plan_tasks = parse_plan_tasks()
     if plan_tasks["total"] > 0:
         section("Implementation Plan")
         print_plan_summary(plan_tasks)
 
-        if plan_tasks["blocked"] > 0:
-            print()
-            warn(f"{plan_tasks['blocked']} task(s) blocked:")
-            for task in plan_tasks["tasks"]:
-                if task["status"] == "blocked":
-                    print(f"      {c(RED, '[B]')} {task['text']}")
+    # ── Run loop ────────────────────────────────────────────────────────
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_log_dir = LOGS_ROOT / run_id
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    info(f"Logs:       {run_log_dir}/iter-NN/")
 
-        if mode == "build" and plan_tasks["blocked"] > 0:
-            print()
-            error("Resolve blocked tasks before starting build iterations.")
-            return 1
-    elif mode == "build":
-        print()
-        warn("No IMPLEMENTATION_PLAN.md found or no tasks in it.")
-        info("Consider running in plan mode first.")
-
-    # ── Run loop ─────────────────────────────────────────────────────────
-
-    totals = {
-        "tokens_in": 0,
-        "tokens_out": 0,
-        "cost_usd": 0,
-        "duration_s": 0,
-    }
-
+    totals = {"tokens_in": 0, "tokens_out": 0, "duration_s": 0}
     start_time = time.monotonic()
     iteration = 0
     consecutive_no_changes = 0
@@ -927,132 +904,144 @@ def main() -> int:
     try:
         while True:
             iteration += 1
-
-            # Check iteration limit
             if iteration > max_iterations:
                 print()
                 success(f"Reached max iterations ({max_iterations}). Stopping.")
                 break
 
-            # Check if no substantive changes for 2 consecutive iterations
             if consecutive_no_changes >= 2:
                 print()
-                warn("No substantive changes in the last 2 iterations. Stopping.")
+                warn("No changes in the last 2 iterations. Stopping.")
                 break
 
-            # In build mode, check if plan is complete or only blocked items remain
-            if stop_on_complete and iteration > 1:
-                plan_tasks = parse_plan_tasks()
-                if plan_tasks["total"] > 0 and plan_tasks["pending"] == 0:
+            # Stop condition: topmost non-done is blocker or nothing left.
+            if mode == "build":
+                kind, task = next_pending_or_blocker()
+                if kind == "done":
                     print()
-                    if plan_tasks["blocked"] > 0:
-                        banner("No actionable tasks remain")
-                        print_plan_summary(plan_tasks)
-                        warn(f"{plan_tasks['blocked']} task(s) blocked — needs human intervention.")
-                    else:
-                        banner("All tasks complete!")
-                        print_plan_summary(plan_tasks)
-                        success("Implementation plan is fully checked off.")
-                    info("Stopping.")
+                    banner("All tasks complete!")
+                    print_plan_summary(parse_plan_tasks())
+                    break
+                if kind == "blocker":
+                    print()
+                    banner("Next task is blocked — human intervention needed")
+                    print(f"      {c(RED, '[B]')} {task}")
                     break
 
-            # ── Iteration header ─────────────────────────────────────────
-
             iter_label = f"Iteration {iteration} / {max_iterations}"
-
             print()
             print(c(CYAN, f"  {'─' * 50}"))
             print(c(BOLD, f"  {iter_label}  ({mode.upper()})  agent={agent} model={model}"))
             print(c(CYAN, f"  {'─' * 50}"))
-
             if mode == "build":
-                plan_tasks = parse_plan_tasks()
-                if plan_tasks["total"] > 0:
-                    print_plan_summary(plan_tasks)
+                print_plan_summary(parse_plan_tasks())
+                info(f"Task: {task[:100]}")
 
-            # ── Run agent ────────────────────────────────────────────────
-
-            info(f"Running {agent}...")
+            iter_log_dir = run_log_dir / f"iter-{iteration:02d}"
+            iter_log_dir.mkdir(parents=True, exist_ok=True)
             print()
 
-            iter_result = run_agent_iteration(prompt_file, model, agent)
+            qa_attempts = 0
+            qa_outcome = ""
 
-            if not iter_result["success"]:
-                error(f"{agent} iteration failed: {iter_result.get('error', 'unknown error')}")
-                if iteration == 1:
-                    return 1
-                warn("Continuing to next iteration...")
-                continue
+            if mode == "build":
+                cycle = run_qa_cycle(task, model, agent, qa_max_attempts, iter_log_dir)
+                metrics = cycle["totals"]
+                qa_attempts = cycle["attempts"]
 
-            # Update totals
-            totals["tokens_in"] += iter_result["tokens_in"]
-            totals["tokens_out"] += iter_result["tokens_out"]
-            totals["cost_usd"] += iter_result["cost_usd"]
-            totals["duration_s"] += iter_result["duration_s"]
+                if cycle["outcome"] == "agent_error":
+                    error(f"{agent} call failed: {cycle.get('error', 'unknown error')}")
+                    if iteration == 1:
+                        return 1
+                    warn("Continuing to next iteration...")
+                    continue
 
-            # ── Build report & commit ─────────────────────────────────────
+                if cycle["outcome"] == "pass":
+                    qa_outcome = "PASS"
+                    # Belt-and-braces: if the QA agent forgot to flip the
+                    # marker, do it ourselves so the next iteration doesn't
+                    # repeat the same task.
+                    still_pending, still_text = next_pending_or_blocker()
+                    if still_pending == "pending" and still_text == task:
+                        warn("QA passed but did not flip the marker — flipping now.")
+                        mark_task_done(task)
+                    success(f"Marked task done: {task[:60]}")
+                else:  # blocked
+                    qa_outcome = "BLOCKED"
+                    reason = cycle.get("first_issue") or "QA failed"
+                    if mark_task_blocked(task, reason):
+                        warn(f"Marked task blocked: {task[:60]} — {reason}")
+                title = cycle["title"]
+                summary = cycle["summary"]
+            else:
+                info(f"Running {agent} (plan)…")
+                plan_log = iter_log_dir / "plan.jsonl"
+                res = run_agent(
+                    Path(PLAN_PROMPT).read_text(),
+                    plan_log, model, agent,
+                )
+                metrics = {
+                    "tokens_in": res["tokens_in"],
+                    "tokens_out": res["tokens_out"],
+                    "duration_s": res["duration_s"],
+                }
+                if not res["success"]:
+                    error(f"{agent} iteration failed: {res.get('error', 'unknown error')}")
+                    if iteration == 1:
+                        return 1
+                    warn("Continuing to next iteration...")
+                    continue
+                title, summary = parse_title_summary(res.get("result_text", ""))
 
-            msg = build_commit_message(mode, iteration, max_iterations, iter_result.get("result_text", ""), iter_result, model, agent)
+            for k in totals:
+                totals[k] += metrics[k]
 
-            # Print the same message that goes into the commit
+            msg = build_commit_message(
+                mode, iteration, max_iterations,
+                title, summary, metrics, model, agent,
+                qa_attempts=qa_attempts, qa_outcome=qa_outcome,
+            )
+
             print()
             print(c(CYAN, f"  {'─' * 50}"))
             for line in msg.splitlines():
                 print(f"  {line}")
             print(c(CYAN, f"  {'─' * 50}"))
+            print()
+            info(f"Totals: {fmt_tokens(totals['tokens_in'])} in / {fmt_tokens(totals['tokens_out'])} out / {fmt_duration(totals['duration_s'])}")
 
-            print_running_totals(iteration, totals)
-
-            # Commit — always commit so the per-iteration logs are captured, but
-            # only the changes outside THINKING.md / stream.jsonl count as progress.
-            substantive = has_substantive_changes()
             if has_uncommitted_changes():
-                subprocess.run(["git", "add", "-A"], capture_output=True)
-                subprocess.run(["git", "commit", "-m", msg], capture_output=True)
-                success("Committed." if substantive else "Committed (logs only).")
-            if substantive:
+                _git("add", "-A")
+                _git("commit", "-m", msg)
+                sha = git_head()
+                (iter_log_dir / "commit.txt").write_text(f"{sha} {msg.splitlines()[0]}\n")
+                success(f"Committed {sha}.")
                 consecutive_no_changes = 0
             else:
                 consecutive_no_changes += 1
-                info(f"No substantive changes ({consecutive_no_changes} consecutive iteration{'s' if consecutive_no_changes != 1 else ''} without changes)")
-
+                info(f"No changes ({consecutive_no_changes} consecutive iteration{'s' if consecutive_no_changes != 1 else ''} without changes)")
 
     except KeyboardInterrupt:
         print()
         print()
         warn("Interrupted by user.")
 
-    # ── Final summary ────────────────────────────────────────────────────
-
-    wall_time = time.monotonic() - start_time
-
+    # ── Final summary ───────────────────────────────────────────────────
+    wall = time.monotonic() - start_time
     banner("Loop Complete")
-
     info(f"Iterations completed: {c(BOLD, str(iteration - 1))}")
-    info(f"Wall time: {fmt_duration(wall_time)}")
-
+    info(f"Wall time: {fmt_duration(wall)}")
     section("Total Token Usage")
     print(f"      Input:  {c(CYAN, fmt_tokens(totals['tokens_in']))}")
     print(f"      Output: {c(CYAN, fmt_tokens(totals['tokens_out']))}")
-    if totals["cost_usd"]:
-        print(f"      Cost:   {c(DIM, fmt_cost(totals['cost_usd']))}")
-
     if mode == "build":
         plan_tasks = parse_plan_tasks()
         if plan_tasks["total"] > 0:
             section("Final Plan Status")
             print_plan_summary(plan_tasks)
-
-    head_final = get_git_head()
-    info(f"HEAD: {c(DIM, head_final)}")
+    info(f"HEAD: {c(DIM, git_head())}")
+    info(f"Logs: {run_log_dir}/")
     print()
-
-    section("⚠  Before you push")
-    warn(f"Each iteration commits the raw Claude logs ({THINKING_LOG} / {STREAM_LOG}).")
-    warn("These can contain secrets, credentials, or file contents from this run.")
-    warn("Review the commits (and consider squashing/rebasing) before pushing anywhere.")
-    print()
-
     return 0
 
 
